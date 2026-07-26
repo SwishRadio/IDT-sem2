@@ -29,8 +29,8 @@
 #include <ArduinoJson.h>
 
 // ==================== CONFIGURATION ====================
-const char* ssid     = "microwave";  // <-- Update
-const char* password = "passwD12";           // <-- Update
+const char* ssid     = "wifi/internet_name";  // <-- Update
+const char* password = "password";           // <-- Update
 
 // Medical thresholds (more forgiving)
 const int   HEART_RATE_MIN   = 45;    // BPM – bradycardia
