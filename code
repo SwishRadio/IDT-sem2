@@ -1,13 +1,23 @@
 /*
- * Complete IoT Health Monitoring System for ESP32
- * Sensors: HW-827 (Heartbeat), DS18B20 (Temperature), MPU6050 (Accelerometer/Gyroscope)
- * Features: Live Web Dashboard, Fall Detection, Emergency Alerts
- * 
- * Pin Connections:
- * - Heartbeat Sensor (HW-827)  -> GPIO34 (ADC)
- * - DS18B20 Temperature Sensor  -> GPIO4 (OneWire)
- * - MPU6050 I2C SDA            -> GPIO21
- * - MPU6050 I2C SCL            -> GPIO22
+ * ============================================================
+ * IoT Health Monitoring System v2.0 — ESP32
+ * ============================================================
+ * Sensors:
+ *   HW-827 (Heartbeat)   -> GPIO34 (ADC / Digital interrupt)
+ *   DS18B20 (Temperature)-> GPIO4  (OneWire)
+ *   MPU6050 (Accel/Gyro) -> GPIO21 (SDA), GPIO22 (SCL)
+ *
+ * Improvements over v1:
+ *   - Multi-stage fall detection: free-fall → impact → inactivity
+ *   - Orientation-based post-fall confirmation
+ *   - More forgiving temperature thresholds (35.0 – 39.5 °C)
+ *   - Live scrolling charts for BPM & Temperature (pure canvas)
+ *   - Animated heart SVG and temperature gauge
+ *   - Separate /api/history endpoint for graph data
+ *   - Dark-mode medical dashboard UI
+ *   - WiFi auto-reconnect
+ *   - Uptime and alert-count stats
+ * ============================================================
  */
 
 #include <WiFi.h>
@@ -17,936 +27,1119 @@
 #include <DallasTemperature.h>
 #include <MPU6050_tockn.h>
 #include <ArduinoJson.h>
-#include <Ticker.h>
 
 // ==================== CONFIGURATION ====================
-// WiFi Credentials - UPDATE THESE
-const char* ssid = "Airtel_FREJ_RAJ-5G";        // Change this
-const char* password = "lmipG#132@";
+const char* ssid     = "microwave";  // <-- Update
+const char* password = "passwD12";           // <-- Update
 
-// Medical Thresholds
-const int HEART_RATE_MIN = 50;      // Bradycardia threshold (BPM)
-const int HEART_RATE_MAX = 120;     // Tachycardia threshold (BPM)
-const float TEMP_MIN = 36.0;        // Hypothermia threshold (C)
-const float TEMP_MAX = 38.5;        // Fever threshold (C)
+// Medical thresholds (more forgiving)
+const int   HEART_RATE_MIN   = 45;    // BPM – bradycardia
+const int   HEART_RATE_MAX   = 130;   // BPM – tachycardia
+const float TEMP_MIN         = 35.0f; // °C  – mild hypothermia boundary
+const float TEMP_MAX         = 39.5f; // °C  – high fever boundary
 
-// Fall detection parameters
-const float FALL_ACCEL_THRESHOLD = 24.0;  // m/s^2 - typical fall > 2.5g
-const unsigned long FALL_RECOVERY_TIME = 5000;  // ms before auto-clearing fall
-const unsigned long EMERGENCY_COOLDOWN = 30000; // ms between emergency alerts
+// Fall detection tuning
+const float FREEFALL_THRESHOLD   = 3.0f;   // m/s² – near-zero g = free-fall
+const float IMPACT_THRESHOLD     = 28.0f;  // m/s² – hard impact after free-fall
+const float INACTIVITY_THRESHOLD = 10.5f;  // m/s² – ~1 g, lying still
+const unsigned long FREEFALL_WINDOW    = 120;   // ms  – max free-fall duration
+const unsigned long IMPACT_WINDOW      = 800;   // ms  – look for impact after FF
+const unsigned long INACTIVITY_WINDOW  = 1500;  // ms  – inactivity confirms fall
+const unsigned long FALL_RECOVERY_TIME = 10000; // ms  – auto-clear if no alert
+const unsigned long EMERGENCY_COOLDOWN = 25000; // ms  – min gap between alerts
 
-// Smoothing filters
-const int BPM_SAMPLE_SIZE = 10;
-const int TEMP_SAMPLE_SIZE = 5;
+// Smoothing
+const int BPM_SAMPLE_SIZE  = 12;
+const int TEMP_SAMPLE_SIZE = 6;
 
-// ==================== PIN DEFINITIONS ====================
-#define HEARTBEAT_PIN 34        // GPIO34 for HW-827 analog output
-#define ONE_WIRE_BUS 4          // GPIO4 for DS18B20
+// History buffer for graphs (60 data points ≈ 60 s)
+const int HISTORY_SIZE = 60;
 
-// ==================== GLOBAL OBJECTS ====================
-WebServer server(80);
-OneWire oneWire(ONE_WIRE_BUS);
+// ==================== PINS ====================
+#define HEARTBEAT_PIN  34
+#define ONE_WIRE_BUS    4
+
+// ==================== OBJECTS ====================
+WebServer         server(80);
+OneWire           oneWire(ONE_WIRE_BUS);
 DallasTemperature ds18b20(&oneWire);
-MPU6050 mpu(Wire);
-Ticker sensorTicker;
+MPU6050           mpu(Wire);
 
 // ==================== DATA STRUCTURES ====================
 struct SensorData {
-  float heartRate = 0.0;
-  float temperature = 0.0;
-  bool fallDetected = false;
-  bool emergencyActive = false;
+  float heartRate   = 0.0f;
+  float temperature = 0.0f;
+  bool  fallDetected    = false;
+  bool  emergencyActive = false;
+  float accelMag = 0.0f;           // current total acceleration magnitude
   float accelX = 0, accelY = 0, accelZ = 0;
-  float gyroX = 0, gyroY = 0, gyroZ = 0;
+  float gyroX  = 0, gyroY  = 0, gyroZ  = 0;
   unsigned long lastUpdate = 0;
 };
 
 struct SensorStatus {
-  bool heartbeatOk = false;
-  bool tempOk = false;
-  bool mpuOk = false;
-  bool wifiOk = false;
+  bool   heartbeatOk = false;
+  bool   tempOk      = false;
+  bool   mpuOk       = false;
+  bool   wifiOk      = false;
   String errorMessages = "";
 };
 
-// ==================== GLOBAL VARIABLES ====================
-SensorData sensor;
-SensorStatus status;
+struct HistoryBuffer {
+  float bpm[HISTORY_SIZE];
+  float temp[HISTORY_SIZE];
+  int   head = 0;
+  int   count = 0;
+  HistoryBuffer() {
+    memset(bpm,  0, sizeof(bpm));
+    memset(temp, 0, sizeof(temp));
+  }
+  void push(float b, float t) {
+    bpm[head]  = b;
+    temp[head] = t;
+    head = (head + 1) % HISTORY_SIZE;
+    if (count < HISTORY_SIZE) count++;
+  }
+};
 
-// Heartbeat timing
-volatile unsigned long lastBeatTime = 0;
-volatile int beatInterval = 0;
+// ==================== GLOBALS ====================
+SensorData    sensor;
+SensorStatus  sensorStatus;
+HistoryBuffer history;
+
+// BPM processing
+volatile unsigned long lastBeatTimeMicros = 0;
+volatile unsigned long beatIntervalMicros = 0;
 volatile bool newBeatAvailable = false;
-int bpmBuffer[BPM_SAMPLE_SIZE] = {0};
-int bpmBufferIndex = 0;
+int   bpmBuffer[BPM_SAMPLE_SIZE] = {0};
+int   bpmBufferIdx = 0;
+
+// Temperature smoothing
 float tempBuffer[TEMP_SAMPLE_SIZE] = {0};
-int tempBufferIndex = 0;
+int   tempBufferIdx = 0;
+bool  tempBufferFull = false;
+
+// Fall detection state machine
+enum FallState { FALL_IDLE, FALL_FREEFALL, FALL_IMPACT, FALL_INACTIVITY };
+FallState fallState = FALL_IDLE;
+unsigned long fallStateTime = 0;
+unsigned long fallConfirmedTime = 0;
 
 // Emergency timing
-unsigned long lastHeartAlert = 0;
-unsigned long lastTempAlert = 0;
-unsigned long lastFallAlert = 0;
+unsigned long lastHeartAlert  = 0;
+unsigned long lastTempAlert   = 0;
+unsigned long lastFallAlert   = 0;
 unsigned long lastEmergencyTime = 0;
 
-// System state
-unsigned long lastSerialOutput = 0;
-unsigned long lastSensorRead = 0;
+// Stats
+unsigned long systemStartTime = 0;
+unsigned int  totalAlerts     = 0;
+
+// History push interval
+unsigned long lastHistoryPush = 0;
+
+// Heartbeat watchdog
 unsigned long lastHeartbeatTime = 0;
 
-// ==================== HEARTBEAT SENSOR HANDLER ====================
+// ==================== ISR ====================
 void IRAM_ATTR heartbeatISR() {
   unsigned long now = micros();
-  static unsigned long lastDebounceTime = 0;
-  
-  // Debounce: ignore pulses within 250ms
-  if ((now - lastDebounceTime) > 250000) {
-    beatInterval = now - lastBeatTime;
-    lastBeatTime = now;
-    newBeatAvailable = true;
-    lastDebounceTime = now;
+  // Debounce: ignore if < 300 ms since last beat
+  if ((now - lastBeatTimeMicros) > 300000UL) {
+    beatIntervalMicros = now - lastBeatTimeMicros;
+    lastBeatTimeMicros = now;
+    newBeatAvailable   = true;
   }
 }
 
-// Calculate BPM from beat intervals
+// ==================== BPM CALCULATION ====================
 float calculateBPM() {
-  if (beatInterval > 0 && beatInterval < 2000000) {  // Valid between 30-300 BPM
-    float instantBPM = 60000000.0 / beatInterval;
-    if (instantBPM >= 30 && instantBPM <= 250) {
-      // Moving average filter
-      bpmBuffer[bpmBufferIndex] = (int)instantBPM;
-      bpmBufferIndex = (bpmBufferIndex + 1) % BPM_SAMPLE_SIZE;
-      
-      int sum = 0;
-      int count = 0;
-      for (int i = 0; i < BPM_SAMPLE_SIZE; i++) {
-        if (bpmBuffer[i] > 0) {
-          sum += bpmBuffer[i];
-          count++;
-        }
-      }
-      return (count > 0) ? (float)(sum / count) : 0;
-    }
+  unsigned long interval = beatIntervalMicros;
+  if (interval == 0) return sensor.heartRate;
+
+  // Valid window: 25–220 BPM  (273 ms – 2400 ms)
+  if (interval < 272727UL || interval > 2400000UL) return sensor.heartRate;
+
+  float instantBPM = 60000000.0f / (float)interval;
+  if (instantBPM < 25.0f || instantBPM > 220.0f) return sensor.heartRate;
+
+  bpmBuffer[bpmBufferIdx] = (int)instantBPM;
+  bpmBufferIdx = (bpmBufferIdx + 1) % BPM_SAMPLE_SIZE;
+
+  long  sum   = 0;
+  int   count = 0;
+  for (int i = 0; i < BPM_SAMPLE_SIZE; i++) {
+    if (bpmBuffer[i] > 0) { sum += bpmBuffer[i]; count++; }
   }
-  return sensor.heartRate;  // Return last valid value
+  return (count > 0) ? (float)sum / count : sensor.heartRate;
 }
 
-// ==================== TEMPERATURE SENSOR ====================
+// ==================== TEMPERATURE ====================
 float readTemperature() {
   ds18b20.requestTemperatures();
-  float temp = ds18b20.getTempCByIndex(0);
-  
-  if (temp == DEVICE_DISCONNECTED_C || temp < -20 || temp > 100) {
-    status.tempOk = false;
-    status.errorMessages = "DS18B20 not detected!";
-    Serial.println("[ERROR] Temperature sensor not found!");
-    return sensor.temperature;  // Return last valid value
+  float raw = ds18b20.getTempCByIndex(0);
+
+  if (raw == DEVICE_DISCONNECTED_C || raw < -20.0f || raw > 60.0f) {
+    sensorStatus.tempOk = false;
+    sensorStatus.errorMessages = "DS18B20 disconnected";
+    return sensor.temperature;
   }
-  
-  // Moving average filter
-  tempBuffer[tempBufferIndex] = temp;
-  tempBufferIndex = (tempBufferIndex + 1) % TEMP_SAMPLE_SIZE;
-  
+
+  tempBuffer[tempBufferIdx] = raw;
+  tempBufferIdx = (tempBufferIdx + 1) % TEMP_SAMPLE_SIZE;
+  if (tempBufferIdx == 0) tempBufferFull = true;
+
+  int   n   = tempBufferFull ? TEMP_SAMPLE_SIZE : tempBufferIdx;
   float sum = 0;
-  int count = 0;
-  for (int i = 0; i < TEMP_SAMPLE_SIZE; i++) {
-    if (tempBuffer[i] > -50) {
-      sum += tempBuffer[i];
-      count++;
-    }
-  }
-  
-  status.tempOk = true;
-  return (count > 0) ? (sum / count) : temp;
+  for (int i = 0; i < n; i++) sum += tempBuffer[i];
+
+  sensorStatus.tempOk = true;
+  sensorStatus.errorMessages = "";
+  return sum / n;
 }
 
-// ==================== MPU6050 INITIALIZATION ====================
+// ==================== MPU6050 INIT ====================
 bool initMPU6050() {
-  Wire.begin(21, 22);  // SDA=GPIO21, SCL=GPIO22
+  Wire.begin(21, 22);
   Wire.setClock(400000);
-  delay(100);
-  
+  delay(150);
+
   mpu.begin();
+  delay(200);
+  Serial.println("[MPU] Calibrating gyro offsets (keep still)...");
   mpu.calcGyroOffsets(true);
-  delay(1000);
-  
-  status.mpuOk = true;
-  Serial.println("[INFO] MPU6050 initialized successfully");
+  delay(500);
+
+  sensorStatus.mpuOk = true;
+  Serial.println("[MPU] MPU6050 ready.");
   return true;
 }
 
-// ==================== FALL DETECTION ====================
+// ==================== FALL DETECTION (multi-stage) ====================
+/*
+ * State machine:
+ *   IDLE  -> FREEFALL   : accelMag < FREEFALL_THRESHOLD for ≥ 1 sample
+ *   FREEFALL -> IMPACT  : accelMag > IMPACT_THRESHOLD within IMPACT_WINDOW ms
+ *   FREEFALL -> IDLE    : timed out (IMPACT_WINDOW) without impact  → false alarm
+ *   IMPACT -> INACTIVITY: accelMag < INACTIVITY_THRESHOLD for INACTIVITY_WINDOW ms
+ *   INACTIVITY -> IDLE  : person moved (accelMag spike) → probably ok
+ *   INACTIVITY → CONFIRM: stayed still → FALL CONFIRMED
+ */
 void updateFallDetection() {
-  if (!status.mpuOk) return;
-  
-  mpu.update();  // Read latest data
-  
+  if (!sensorStatus.mpuOk) return;
+
+  mpu.update();
   sensor.accelX = mpu.getAccX();
   sensor.accelY = mpu.getAccY();
   sensor.accelZ = mpu.getAccZ();
-  sensor.gyroX = mpu.getGyroX();
-  sensor.gyroY = mpu.getGyroY();
-  sensor.gyroZ = mpu.getGyroZ();
-  
-  // Calculate total acceleration magnitude
-  float accelMagnitude = sqrt(
-    sq(sensor.accelX) + 
-    sq(sensor.accelY) + 
-    sq(sensor.accelZ)
-  );
-  
-  // Fall detection logic
-  static unsigned long impactTime = 0;
-  static bool potentialFall = false;
-  
-  if (accelMagnitude > FALL_ACCEL_THRESHOLD && !sensor.fallDetected) {
-    if (!potentialFall) {
-      potentialFall = true;
-      impactTime = millis();
-      Serial.printf("[FALL] Impact detected! Magnitude: %.2f m/s^2\n", accelMagnitude);
-    }
+  sensor.gyroX  = mpu.getGyroX();
+  sensor.gyroY  = mpu.getGyroY();
+  sensor.gyroZ  = mpu.getGyroZ();
+
+  float mag = sqrt(sq(sensor.accelX) + sq(sensor.accelY) + sq(sensor.accelZ));
+  sensor.accelMag = mag;
+
+  unsigned long now = millis();
+
+  switch (fallState) {
+    // ---- IDLE: watching for free-fall ----
+    case FALL_IDLE:
+      if (mag < FREEFALL_THRESHOLD) {
+        fallState     = FALL_FREEFALL;
+        fallStateTime = now;
+        Serial.printf("[FALL] Free-fall suspected (mag=%.2f)\n", mag);
+      }
+      break;
+
+    // ---- FREE-FALL: waiting for impact ----
+    case FALL_FREEFALL:
+      if (mag > IMPACT_THRESHOLD) {
+        fallState     = FALL_IMPACT;
+        fallStateTime = now;
+        Serial.printf("[FALL] Impact detected after free-fall (mag=%.2f)\n", mag);
+      } else if (now - fallStateTime > IMPACT_WINDOW) {
+        // Never got the impact – back to idle
+        fallState = FALL_IDLE;
+        Serial.println("[FALL] Free-fall timeout – no impact, resetting.");
+      }
+      break;
+
+    // ---- IMPACT: waiting for inactivity ----
+    case FALL_IMPACT:
+      if (mag < INACTIVITY_THRESHOLD) {
+        // Starting to be still – start inactivity timer
+        if (fallStateTime == 0 || mag < INACTIVITY_THRESHOLD) {
+          fallState     = FALL_INACTIVITY;
+          fallStateTime = now;
+          Serial.println("[FALL] Post-impact inactivity – confirming fall...");
+        }
+      } else if (now - fallStateTime > 3000) {
+        // Still very active 3 s after impact → person is moving, false alarm
+        fallState = FALL_IDLE;
+        Serial.println("[FALL] Active movement after impact – probable false alarm.");
+      }
+      break;
+
+    // ---- INACTIVITY: confirming the fall ----
+    case FALL_INACTIVITY:
+      if (mag > INACTIVITY_THRESHOLD + 3.0f) {
+        // Sudden movement – person got up
+        fallState = FALL_IDLE;
+        Serial.println("[FALL] Person moved – false alarm cleared.");
+      } else if (now - fallStateTime >= INACTIVITY_WINDOW) {
+        // Confirmed!
+        if (!sensor.fallDetected) {
+          sensor.fallDetected    = true;
+          sensor.emergencyActive = true;
+          fallConfirmedTime      = now;
+          totalAlerts++;
+          Serial.println("[ALERT] *** FALL CONFIRMED *** Medical assistance may be needed!");
+        }
+      }
+      break;
   }
-  
-  // Check for post-fall inactivity (lying still)
-  if (potentialFall && !sensor.fallDetected) {
-    unsigned long timeSinceImpact = millis() - impactTime;
-    if (timeSinceImpact > 1000 && accelMagnitude < 11.0) {  // < 1.1g for 1 second
-      sensor.fallDetected = true;
-      sensor.emergencyActive = true;
-      potentialFall = false;
-      Serial.println("[ALERT] FALL DETECTED! Medical assistance may be needed!");
-    } else if (timeSinceImpact > 3000 && accelMagnitude > 15.0) {
-      // False alarm - person moved quickly after impact
-      potentialFall = false;
-      Serial.println("[INFO] Fall impact detected but person moved - probable false alarm");
-    }
-  }
-  
-  // Auto-clear fall after recovery time
-  if (sensor.fallDetected && (millis() - impactTime) > FALL_RECOVERY_TIME) {
+
+  // Auto-clear fall alert after FALL_RECOVERY_TIME
+  if (sensor.fallDetected && (now - fallConfirmedTime > FALL_RECOVERY_TIME)) {
     sensor.fallDetected = false;
-    Serial.println("[INFO] Fall alert auto-cleared after recovery period");
+    fallState = FALL_IDLE;
+    Serial.println("[FALL] Fall alert auto-cleared (recovery timeout).");
   }
 }
 
-// ==================== EMERGENCY CHECKING ====================
+// ==================== EMERGENCY LOGIC ====================
 void checkEmergencyConditions() {
   unsigned long now = millis();
-  bool newEmergency = false;
-  String emergencyReason = "";
-  
-  // Heart rate check
-  if (status.heartbeatOk && sensor.heartRate > 0) {
-    if (sensor.heartRate < HEART_RATE_MIN) {
-      if (now - lastHeartAlert > EMERGENCY_COOLDOWN) {
-        newEmergency = true;
-        emergencyReason = "LOW HEART RATE: " + String(sensor.heartRate, 0) + " BPM";
-        lastHeartAlert = now;
-      }
-    } else if (sensor.heartRate > HEART_RATE_MAX) {
-      if (now - lastHeartAlert > EMERGENCY_COOLDOWN) {
-        newEmergency = true;
-        emergencyReason = "HIGH HEART RATE: " + String(sensor.heartRate, 0) + " BPM";
-        lastHeartAlert = now;
-      }
+  bool   newEmergency = false;
+  String reason       = "";
+
+  if (sensorStatus.heartbeatOk && sensor.heartRate > 0) {
+    if (sensor.heartRate < HEART_RATE_MIN && now - lastHeartAlert > EMERGENCY_COOLDOWN) {
+      newEmergency    = true;
+      reason          = "LOW HEART RATE: " + String((int)sensor.heartRate) + " BPM";
+      lastHeartAlert  = now;
+    } else if (sensor.heartRate > HEART_RATE_MAX && now - lastHeartAlert > EMERGENCY_COOLDOWN) {
+      newEmergency    = true;
+      reason          = "HIGH HEART RATE: " + String((int)sensor.heartRate) + " BPM";
+      lastHeartAlert  = now;
     }
   }
-  
-  // Temperature check
-  if (status.tempOk && sensor.temperature > -50) {
-    if (sensor.temperature < TEMP_MIN) {
-      if (now - lastTempAlert > EMERGENCY_COOLDOWN) {
-        newEmergency = true;
-        emergencyReason = "LOW TEMPERATURE: " + String(sensor.temperature, 1) + "C";
-        lastTempAlert = now;
-      }
-    } else if (sensor.temperature > TEMP_MAX) {
-      if (now - lastTempAlert > EMERGENCY_COOLDOWN) {
-        newEmergency = true;
-        emergencyReason = "HIGH TEMPERATURE: " + String(sensor.temperature, 1) + "C";
-        lastTempAlert = now;
-      }
+
+  if (sensorStatus.tempOk && sensor.temperature > -50.0f) {
+    if (sensor.temperature < TEMP_MIN && now - lastTempAlert > EMERGENCY_COOLDOWN) {
+      newEmergency   = true;
+      reason         = "LOW TEMPERATURE: " + String(sensor.temperature, 1) + " C";
+      lastTempAlert  = now;
+    } else if (sensor.temperature > TEMP_MAX && now - lastTempAlert > EMERGENCY_COOLDOWN) {
+      newEmergency   = true;
+      reason         = "HIGH TEMPERATURE: " + String(sensor.temperature, 1) + " C";
+      lastTempAlert  = now;
     }
   }
-  
-  // Fall check
-  if (sensor.fallDetected && (now - lastFallAlert > EMERGENCY_COOLDOWN)) {
-    newEmergency = true;
-    emergencyReason = "FALL DETECTED - Person may be injured!";
+
+  if (sensor.fallDetected && now - lastFallAlert > EMERGENCY_COOLDOWN) {
+    newEmergency  = true;
+    reason        = "FALL DETECTED";
     lastFallAlert = now;
   }
-  
+
   if (newEmergency) {
     sensor.emergencyActive = true;
-    lastEmergencyTime = now;
-    Serial.println("\n!!! MEDICAL EMERGENCY !!!");
-    Serial.println(emergencyReason);
-    Serial.println("!!! PLEASE CHECK ON PATIENT IMMEDIATELY !!!\n");
+    lastEmergencyTime      = now;
+    totalAlerts++;
+    Serial.println("\n!!! MEDICAL EMERGENCY: " + reason + " !!!\n");
   }
-  
-  // Auto-clear emergencies after cooldown if vitals normalize
-  if (sensor.emergencyActive && !sensor.fallDetected && (now - lastEmergencyTime > EMERGENCY_COOLDOWN)) {
-    bool vitalsNormal = true;
-    if (status.heartbeatOk && sensor.heartRate > 0) {
-      vitalsNormal &= (sensor.heartRate >= HEART_RATE_MIN && sensor.heartRate <= HEART_RATE_MAX);
-    }
-    if (status.tempOk && sensor.temperature > -50) {
-      vitalsNormal &= (sensor.temperature >= TEMP_MIN && sensor.temperature <= TEMP_MAX);
-    }
-    
-    if (vitalsNormal) {
+
+  // Auto-clear emergency when vitals normalise and no fall
+  if (sensor.emergencyActive && !sensor.fallDetected &&
+      (now - lastEmergencyTime > EMERGENCY_COOLDOWN)) {
+    bool ok = true;
+    if (sensorStatus.heartbeatOk && sensor.heartRate > 0)
+      ok &= (sensor.heartRate >= HEART_RATE_MIN && sensor.heartRate <= HEART_RATE_MAX);
+    if (sensorStatus.tempOk && sensor.temperature > -50.0f)
+      ok &= (sensor.temperature >= TEMP_MIN && sensor.temperature <= TEMP_MAX);
+    if (ok) {
       sensor.emergencyActive = false;
-      Serial.println("[INFO] Emergency cleared - vitals have normalized");
+      Serial.println("[INFO] Emergency auto-cleared – vitals normalised.");
     }
   }
 }
 
-// ==================== WEB SERVER - HTML DASHBOARD ====================
+// ==================== WiFi RECONNECT ====================
+void maintainWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    sensorStatus.wifiOk = false;
+    Serial.println("[WiFi] Reconnecting...");
+    WiFi.reconnect();
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 8000) delay(300);
+    if (WiFi.status() == WL_CONNECTED) {
+      sensorStatus.wifiOk = true;
+      Serial.println("[WiFi] Reconnected: " + WiFi.localIP().toString());
+    }
+  }
+}
+
+// ==================== HTML DASHBOARD ====================
 void handleRoot() {
-  String html = R"rawliteral(
-<!DOCTYPE html>
+  // Served as a multi-line raw string literal
+  // Using chunked sends to fit within stack limits
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+
+  // ---------- HEAD & STYLES ----------
+  server.sendContent(R"rawliteral(<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
-    <title>Medical Monitor - Health Alert System</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', sans-serif;
-            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        
-        .container {
-            max-width: 1300px;
-            margin: 0 auto;
-        }
-        
-        .header {
-            text-align: center;
-            color: white;
-            margin-bottom: 30px;
-        }
-        
-        .header h1 {
-            font-size: 2.2rem;
-            margin-bottom: 10px;
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-        }
-        
-        .header p {
-            font-size: 1rem;
-            opacity: 0.9;
-        }
-        
-        /* Emergency Banner */
-        .emergency-banner {
-            background: linear-gradient(135deg, #ff0844 0%, #ffb199 100%);
-            border-radius: 20px;
-            padding: 25px;
-            margin-bottom: 25px;
-            text-align: center;
-            animation: pulse 0.8s ease-in-out infinite;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-        }
-        
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); }
-            50% { transform: scale(1.02); }
-        }
-        
-        .emergency-banner h2 {
-            color: white;
-            font-size: 1.8rem;
-            margin-bottom: 15px;
-        }
-        
-        .warning-text {
-            color: white;
-            font-size: 1.4rem;
-            font-weight: bold;
-            margin: 15px 0;
-            text-transform: uppercase;
-            letter-spacing: 2px;
-        }
-        
-        .emergency-banner button {
-            background: white;
-            color: #ff0844;
-            border: none;
-            padding: 12px 30px;
-            font-size: 1.1rem;
-            font-weight: bold;
-            border-radius: 50px;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            margin: 5px;
-        }
-        
-        .emergency-banner button:hover {
-            transform: scale(1.05);
-            box-shadow: 0 5px 20px rgba(0,0,0,0.2);
-        }
-        
-        .btn-help {
-            background: #ff0844;
-            color: white !important;
-        }
-        
-        /* Dashboard Cards */
-        .dashboard {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-            gap: 25px;
-            margin-bottom: 25px;
-        }
-        
-        .card {
-            background: rgba(255,255,255,0.95);
-            border-radius: 20px;
-            padding: 25px;
-            backdrop-filter: blur(10px);
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-        }
-        
-        .card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-        }
-        
-        .card h3 {
-            color: #2a5298;
-            font-size: 1.5rem;
-            margin-bottom: 20px;
-            border-left: 4px solid #2a5298;
-            padding-left: 15px;
-        }
-        
-        .reading {
-            text-align: center;
-            padding: 20px;
-        }
-        
-        .value {
-            font-size: 4rem;
-            font-weight: bold;
-            color: #1e3c72;
-        }
-        
-        .unit {
-            font-size: 1.2rem;
-            color: #666;
-        }
-        
-        .status-badge {
-            display: inline-block;
-            padding: 8px 20px;
-            border-radius: 50px;
-            font-weight: bold;
-            margin-top: 15px;
-        }
-        
-        .normal {
-            background: #d4edda;
-            color: #155724;
-        }
-        
-        .warning {
-            background: #f8d7da;
-            color: #721c24;
-            animation: blink 1s infinite;
-        }
-        
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.6; }
-        }
-        
-        /* Sensor Status Panel */
-        .status-panel {
-            background: rgba(255,255,255,0.95);
-            border-radius: 20px;
-            padding: 20px;
-            margin-top: 20px;
-        }
-        
-        .status-panel h3 {
-            color: #2a5298;
-            margin-bottom: 15px;
-        }
-        
-        .sensor-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-        }
-        
-        .sensor-item {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            padding: 10px;
-            background: #f8f9fa;
-            border-radius: 10px;
-        }
-        
-        .sensor-status-led {
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            display: inline-block;
-        }
-        
-        .online { background: #28a745; box-shadow: 0 0 5px #28a745; }
-        .offline { background: #dc3545; box-shadow: 0 0 5px #dc3545; }
-        
-        .error-message {
-            color: #dc3545;
-            font-size: 0.9rem;
-            margin-top: 10px;
-            padding: 10px;
-            background: #f8d7da;
-            border-radius: 10px;
-        }
-        
-        footer {
-            text-align: center;
-            color: white;
-            margin-top: 30px;
-            font-size: 0.85rem;
-            opacity: 0.8;
-        }
-        
-        @media (max-width: 768px) {
-            .value { font-size: 2.5rem; }
-            .header h1 { font-size: 1.5rem; }
-            .warning-text { font-size: 1rem; }
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Health Monitor</title>
+<style>
+:root{
+  --bg:#0d1117;--bg2:#161b22;--bg3:#21262d;
+  --border:#30363d;--text:#e6edf3;--sub:#8b949e;
+  --green:#3fb950;--red:#f85149;--orange:#d29922;
+  --blue:#58a6ff;--purple:#bc8cff;--pink:#f78166;
+  --card-r:16px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;padding:20px}
+a{color:var(--blue)}
+.container{max-width:1280px;margin:0 auto}
+
+/* ---- HEADER ---- */
+.header{text-align:center;padding:24px 0 32px}
+.header h1{font-size:1.9rem;font-weight:700;letter-spacing:.5px}
+.header h1 span{color:var(--blue)}
+.header p{color:var(--sub);font-size:.95rem;margin-top:6px}
+.uptime{display:inline-block;background:var(--bg3);border:1px solid var(--border);border-radius:20px;padding:4px 14px;font-size:.8rem;color:var(--sub);margin-top:10px}
+
+/* ---- EMERGENCY BANNER ---- */
+.emergency-banner{
+  background:linear-gradient(135deg,#4a0010,#7a0020);
+  border:2px solid var(--red);border-radius:var(--card-r);
+  padding:28px 24px;margin-bottom:24px;text-align:center;
+  animation:emergPulse 1s ease-in-out infinite;
+  box-shadow:0 0 40px rgba(248,81,73,.35);
+}
+@keyframes emergPulse{0%,100%{box-shadow:0 0 40px rgba(248,81,73,.35)}50%{box-shadow:0 0 70px rgba(248,81,73,.65)}}
+.emergency-banner h2{font-size:1.6rem;color:var(--red);margin-bottom:8px}
+.emergency-banner .emsg{font-size:1.2rem;font-weight:700;color:#fff;margin:12px 0;text-transform:uppercase;letter-spacing:2px}
+.btn{border:none;padding:11px 26px;font-size:1rem;font-weight:600;border-radius:50px;cursor:pointer;transition:transform .2s,box-shadow .2s;margin:5px}
+.btn:hover{transform:scale(1.04);box-shadow:0 4px 18px rgba(0,0,0,.4)}
+.btn-red{background:var(--red);color:#fff}
+.btn-ghost{background:rgba(255,255,255,.12);color:#fff;border:1px solid rgba(255,255,255,.3)}
+
+/* ---- GRID ---- */
+.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin-bottom:20px}
+.grid-3{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:20px;margin-bottom:20px}
+
+/* ---- CARD ---- */
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--card-r);padding:22px;transition:border-color .3s}
+.card.alert-card{border-color:var(--red);box-shadow:0 0 16px rgba(248,81,73,.2)}
+.card-title{font-size:.8rem;font-weight:600;text-transform:uppercase;letter-spacing:1.5px;color:var(--sub);margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.card-title .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot-green{background:var(--green);box-shadow:0 0 6px var(--green)}
+.dot-red{background:var(--red);box-shadow:0 0 6px var(--red);animation:blink .8s infinite}
+.dot-orange{background:var(--orange);box-shadow:0 0 6px var(--orange)}
+.dot-blue{background:var(--blue)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* ---- VITAL DISPLAY ---- */
+.vital-row{display:flex;align-items:center;justify-content:space-between}
+.vital-big{font-size:3.6rem;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.vital-unit{font-size:1rem;color:var(--sub);margin-top:4px}
+.badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:.8rem;font-weight:600;margin-top:10px}
+.badge-ok{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}
+.badge-warn{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.4);animation:blink .8s infinite}
+.badge-idle{background:var(--bg3);color:var(--sub);border:1px solid var(--border)}
+
+/* ---- HEART ANIMATION ---- */
+.heart-svg{display:block;margin:0 auto}
+#heartPath{transform-origin:50% 50%;animation:none}
+.beating #heartPath{animation:heartbeat .6s ease-in-out infinite}
+@keyframes heartbeat{0%,100%{transform:scale(1)}14%{transform:scale(1.18)}28%{transform:scale(1)}42%{transform:scale(1.12)}70%{transform:scale(1)}}
+
+/* ---- TEMPERATURE GAUGE ---- */
+.gauge-wrap{position:relative;width:140px;height:140px;margin:0 auto}
+.gauge-svg{width:140px;height:140px}
+
+/* ---- CANVAS CHARTS ---- */
+.chart-wrap{margin-top:16px;position:relative}
+.chart-label{font-size:.75rem;color:var(--sub);margin-bottom:6px;display:flex;justify-content:space-between}
+canvas.chart{width:100%;height:110px;border-radius:8px;background:var(--bg3);display:block}
+
+/* ---- FALL CARD ---- */
+.fall-icon{font-size:3.5rem;text-align:center;margin:8px 0;transition:all .4s}
+.fall-ok  .fall-icon{filter:none;opacity:.8}
+.fall-bad .fall-icon{animation:shake .4s linear infinite}
+@keyframes shake{0%,100%{transform:rotate(0)}25%{transform:rotate(-12deg)}75%{transform:rotate(12deg)}}
+.accel-bars{margin-top:14px}
+.abar-row{display:flex;align-items:center;gap:8px;margin:5px 0;font-size:.8rem;color:var(--sub)}
+.abar-bg{flex:1;height:6px;background:var(--bg3);border-radius:3px;overflow:hidden}
+.abar-fill{height:100%;border-radius:3px;transition:width .3s}
+
+/* ---- STATUS PANEL ---- */
+.status-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.s-item{background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:12px 16px;display:flex;align-items:center;gap:10px;font-size:.9rem}
+.s-led{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.s-led.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+.s-led.off{background:var(--red);box-shadow:0 0 5px var(--red)}
+
+/* ---- STATS ROW ---- */
+.stats-row{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+.stat-pill{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:12px 18px;flex:1;min-width:130px;text-align:center}
+.stat-pill .sv{font-size:1.6rem;font-weight:700;color:var(--blue)}
+.stat-pill .sl{font-size:.75rem;color:var(--sub);margin-top:2px}
+
+/* ---- FOOTER ---- */
+footer{text-align:center;color:var(--sub);font-size:.8rem;margin-top:30px;padding-top:20px;border-top:1px solid var(--border)}
+
+@media(max-width:600px){
+  .vital-big{font-size:2.6rem}
+  .header h1{font-size:1.4rem}
+  canvas.chart{height:80px}
+}
+</style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1> IoT Health Monitoring System</h1>
-            <p>Real-time Medical Alert System | 24/7 Patient Monitoring</p>
-        </div>
-        
-        <div id="emergencyAlert" style="display: none;">
-            <div class="emergency-banner">
-                <h2> MEDICAL EMERGENCY </h2>
-                <div class="warning-text" id="emergencyMessage">ARE YOU IN NEED OF MEDICAL ASSISTANCE?</div>
-                <button class="btn-help" onclick="requestHelp()"> I NEED ASSISTANCE - CALL FOR HELP</button>
-                <button onclick="clearEmergency()"> I AM OKAY - NO HELP NEEDED</button>
-            </div>
-        </div>
-        
-        <div class="dashboard">
-            <div class="card">
-                <h3> Heart Rate</h3>
-                <div class="reading">
-                    <div class="value"><span id="bpm">--</span><span class="unit"> BPM</span></div>
-                    <div id="heartStatus" class="status-badge normal">Monitoring</div>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h3> Body Temperature</h3>
-                <div class="reading">
-                    <div class="value"><span id="temp">--</span><span class="unit"> C</span></div>
-                    <div id="tempStatus" class="status-badge normal">Monitoring</div>
-                </div>
-            </div>
-            
-            <div class="card">
-                <h3> Fall Detection</h3>
-                <div class="reading">
-                    <div class="value" id="fallStatus"> No Fall</div>
-                    <div id="fallDetail" class="status-badge normal">Patient stable</div>
-                </div>
-            </div>
-        </div>
-        
-        <div class="status-panel">
-            <h3> System Status</h3>
-            <div class="sensor-grid">
-                <div class="sensor-item">
-                    <span class="sensor-status-led" id="heartbeatLed"></span>
-                    <span>Heartbeat Sensor: <span id="heartbeatStatus">--</span></span>
-                </div>
-                <div class="sensor-item">
-                    <span class="sensor-status-led" id="tempLed"></span>
-                    <span>Temperature Sensor: <span id="tempSensorStatus">--</span></span>
-                </div>
-                <div class="sensor-item">
-                    <span class="sensor-status-led" id="mpuLed"></span>
-                    <span>Motion Sensor: <span id="mpuStatus">--</span></span>
-                </div>
-                <div class="sensor-item">
-                    <span class="sensor-status-led" id="wifiLed"></span>
-                    <span>WiFi: <span id="wifiStatus">--</span></span>
-                </div>
-            </div>
-            <div id="errorMessages" class="error-message" style="display: none;"></div>
-        </div>
-        
-        <footer>
-            <p>This is a medical monitoring device. In case of real emergency, contact emergency services immediately.</p>
-            <p>Last update: <span id="lastUpdate">--</span></p>
-        </footer>
+<div class="container">
+
+<div class="header">
+  <h1>&#x1F3E5; <span>Health</span> Monitor</h1>
+  <p>Real-time patient monitoring &mdash; 24/7</p>
+  <div class="uptime">Uptime: <span id="uptimeVal">--</span></div>
+</div>
+
+<!-- Emergency Banner (hidden by default) -->
+<div id="emergencyAlert" style="display:none">
+  <div class="emergency-banner">
+    <h2>&#x26A0;&#xFE0F; MEDICAL EMERGENCY</h2>
+    <div class="emsg" id="emergencyMessage">ARE YOU IN NEED OF MEDICAL ASSISTANCE?</div>
+    <button class="btn btn-red" onclick="requestHelp()">&#x1F198; I NEED HELP &mdash; CALL FOR ASSISTANCE</button>
+    <button class="btn btn-ghost" onclick="clearEmergency()">&#x2705; I AM OKAY &mdash; NO HELP NEEDED</button>
+  </div>
+</div>
+
+<!-- Stats pills -->
+<div class="stats-row">
+  <div class="stat-pill"><div class="sv" id="statBpm">--</div><div class="sl">Heart Rate (BPM)</div></div>
+  <div class="stat-pill"><div class="sv" id="statTemp">--</div><div class="sl">Temperature (°C)</div></div>
+  <div class="stat-pill"><div class="sv" id="statAlerts">0</div><div class="sl">Alerts Today</div></div>
+  <div class="stat-pill"><div class="sv" id="statFall">None</div><div class="sl">Last Fall Event</div></div>
+</div>
+
+<!-- Row 1: Heart + Temp -->
+<div class="grid-2">
+
+  <!-- Heart Rate Card -->
+  <div class="card" id="heartCard">
+    <div class="card-title">
+      <span class="dot dot-red" id="heartDot"></span>
+      HEART RATE
     </div>
-    
-    <script>
-        function updateDashboard() {
-            fetch('/api/data')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('bpm').innerText = data.bpm || '--';
-                    const heartStatus = document.getElementById('heartStatus');
-                    if (data.bpm > 0) {
-                        if (data.bpm < 50) {
-                            heartStatus.innerText = ' LOW HEART RATE';
-                            heartStatus.className = 'status-badge warning';
-                        } else if (data.bpm > 120) {
-                            heartStatus.innerText = ' HIGH HEART RATE';
-                            heartStatus.className = 'status-badge warning';
-                        } else {
-                            heartStatus.innerText = ' Normal Range';
-                            heartStatus.className = 'status-badge normal';
-                        }
-                    }
-                    
-                    document.getElementById('temp').innerText = data.temp ? data.temp.toFixed(1) : '--';
-                    const tempStatus = document.getElementById('tempStatus');
-                    if (data.temp) {
-                        if (data.temp < 36.0) {
-                            tempStatus.innerText = ' LOW TEMPERATURE';
-                            tempStatus.className = 'status-badge warning';
-                        } else if (data.temp > 38.5) {
-                            tempStatus.innerText = ' HIGH TEMPERATURE';
-                            tempStatus.className = 'status-badge warning';
-                        } else {
-                            tempStatus.innerText = ' Normal Range';
-                            tempStatus.className = 'status-badge normal';
-                        }
-                    }
-                    
-                    const fallElement = document.getElementById('fallStatus');
-                    const fallDetail = document.getElementById('fallDetail');
-                    if (data.fall) {
-                        fallElement.innerHTML = ' FALL DETECTED!';
-                        fallDetail.innerText = ' IMMEDIATE ATTENTION NEEDED!';
-                        fallDetail.className = 'status-badge warning';
-                    } else {
-                        fallElement.innerHTML = ' No Fall Detected';
-                        fallDetail.innerText = ' Patient stable';
-                        fallDetail.className = 'status-badge normal';
-                    }
-                    
-                    const emergencyDiv = document.getElementById('emergencyAlert');
-                    if (data.emergency) {
-                        emergencyDiv.style.display = 'block';
-                    } else {
-                        emergencyDiv.style.display = 'none';
-                    }
-                    
-                    updateSensorLed('heartbeatLed', data.heartbeatOk);
-                    document.getElementById('heartbeatStatus').innerText = data.heartbeatOk ? 'Online' : 'Offline';
-                    
-                    updateSensorLed('tempLed', data.tempOk);
-                    document.getElementById('tempSensorStatus').innerText = data.tempOk ? 'Online' : 'Offline';
-                    
-                    updateSensorLed('mpuLed', data.mpuOk);
-                    document.getElementById('mpuStatus').innerText = data.mpuOk ? 'Online' : 'Offline';
-                    
-                    updateSensorLed('wifiLed', data.wifiOk);
-                    document.getElementById('wifiStatus').innerText = data.wifiOk ? 'Connected' : 'Disconnected';
-                    
-                    if (data.errorMsg && data.errorMsg.length > 0) {
-                        const errorDiv = document.getElementById('errorMessages');
-                        errorDiv.innerText = ' ' + data.errorMsg;
-                        errorDiv.style.display = 'block';
-                    } else {
-                        document.getElementById('errorMessages').style.display = 'none';
-                    }
-                    
-                    document.getElementById('lastUpdate').innerText = new Date().toLocaleTimeString();
-                })
-                .catch(error => {
-                    console.error('Error fetching data:', error);
-                });
-        }
-        
-        function updateSensorLed(elementId, isOk) {
-            const led = document.getElementById(elementId);
-            if (isOk) {
-                led.className = 'sensor-status-led online';
-            } else {
-                led.className = 'sensor-status-led offline';
-            }
-        }
-        
-        function requestHelp() {
-            fetch('/api/need_assistance', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        alert("Help request sent! Emergency services have been notified.");
-                        document.getElementById('emergencyAlert').style.display = 'none';
-                    }
-                })
-                .catch(error => console.error('Error:', error));
-        }
-        
-        function clearEmergency() {
-            fetch('/api/clear_emergency', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        document.getElementById('emergencyAlert').style.display = 'none';
-                    }
-                })
-                .catch(error => console.error('Error:', error));
-        }
-        
-        setInterval(updateDashboard, 1000);
-        updateDashboard();
-    </script>
+    <div class="vital-row">
+      <div>
+        <div class="vital-big" id="bpmVal">--</div>
+        <div class="vital-unit">beats per minute</div>
+        <div class="badge badge-idle" id="heartBadge">No Signal</div>
+      </div>
+      <!-- Animated heart -->
+      <svg class="heart-svg" id="heartSvg" width="80" height="72" viewBox="0 0 100 90">
+        <path id="heartPath"
+          d="M50 85 C50 85 5 55 5 28 C5 10 18 2 33 5 C40 7 47 13 50 19 C53 13 60 7 67 5 C82 2 95 10 95 28 C95 55 50 85 50 85Z"
+          fill="#f85149" stroke="none"/>
+      </svg>
+    </div>
+    <div class="chart-wrap">
+      <div class="chart-label"><span>BPM History (60s)</span><span id="bpmRange">--</span></div>
+      <canvas class="chart" id="bpmChart"></canvas>
+    </div>
+  </div>
+
+  <!-- Temperature Card -->
+  <div class="card" id="tempCard">
+    <div class="card-title">
+      <span class="dot dot-blue" id="tempDot"></span>
+      BODY TEMPERATURE
+    </div>
+    <div class="vital-row">
+      <div>
+        <div class="vital-big" id="tempVal">--</div>
+        <div class="vital-unit">degrees Celsius</div>
+        <div class="badge badge-idle" id="tempBadge">No Signal</div>
+      </div>
+      <!-- Gauge -->
+      <div class="gauge-wrap">
+        <svg class="gauge-svg" viewBox="0 0 140 140">
+          <circle cx="70" cy="70" r="54" fill="none" stroke="#21262d" stroke-width="12"/>
+          <circle cx="70" cy="70" r="54" fill="none" stroke="#58a6ff" stroke-width="12"
+            stroke-dasharray="339" stroke-dashoffset="339"
+            stroke-linecap="round" transform="rotate(-90 70 70)"
+            id="gaugeArc" style="transition:stroke-dashoffset .8s ease,stroke .8s ease"/>
+          <text x="70" y="67" text-anchor="middle" fill="#e6edf3" font-size="22" font-weight="700" id="gaugeTxt">--</text>
+          <text x="70" y="84" text-anchor="middle" fill="#8b949e" font-size="11">°C</text>
+        </svg>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <div class="chart-label"><span>Temperature History (60s)</span><span id="tempRange">--</span></div>
+      <canvas class="chart" id="tempChart"></canvas>
+    </div>
+  </div>
+
+</div>
+
+<!-- Row 2: Fall + System -->
+<div class="grid-3">
+
+  <!-- Fall Detection -->
+  <div class="card fall-ok" id="fallCard">
+    <div class="card-title">
+      <span class="dot dot-green" id="fallDot"></span>
+      FALL DETECTION
+    </div>
+    <div class="fall-icon" id="fallIcon">&#x1F9CD;</div>
+    <div style="text-align:center">
+      <div class="badge badge-ok" id="fallBadge">No Fall Detected</div>
+    </div>
+    <div class="accel-bars" id="accelBars">
+      <div class="abar-row"><span style="width:14px">X</span>
+        <div class="abar-bg"><div class="abar-fill" id="barX" style="width:0%;background:#58a6ff"></div></div>
+        <span id="valX" style="width:46px;text-align:right">0.00</span>
+      </div>
+      <div class="abar-row"><span style="width:14px">Y</span>
+        <div class="abar-bg"><div class="abar-fill" id="barY" style="width:0%;background:#3fb950"></div></div>
+        <span id="valY" style="width:46px;text-align:right">0.00</span>
+      </div>
+      <div class="abar-row"><span style="width:14px">Z</span>
+        <div class="abar-bg"><div class="abar-fill" id="barZ" style="width:0%;background:#d29922"></div></div>
+        <span id="valZ" style="width:46px;text-align:right">0.00</span>
+      </div>
+      <div class="abar-row" style="margin-top:6px"><span style="width:14px">|a|</span>
+        <div class="abar-bg"><div class="abar-fill" id="barMag" style="width:0%;background:#bc8cff"></div></div>
+        <span id="valMag" style="width:46px;text-align:right">0.00</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sensor Status -->
+  <div class="card">
+    <div class="card-title"><span class="dot dot-blue"></span>SENSOR STATUS</div>
+    <div class="status-grid">
+      <div class="s-item"><span class="s-led" id="ledHeart"></span><span>Heartbeat: <b id="stHeart">--</b></span></div>
+      <div class="s-item"><span class="s-led" id="ledTemp"></span><span>Temperature: <b id="stTemp">--</b></span></div>
+      <div class="s-item"><span class="s-led" id="ledMpu"></span><span>Motion (MPU): <b id="stMpu">--</b></span></div>
+      <div class="s-item"><span class="s-led" id="ledWifi"></span><span>WiFi: <b id="stWifi">--</b></span></div>
+    </div>
+    <div id="errorBox" style="display:none;margin-top:12px;padding:10px;background:rgba(248,81,73,.1);border:1px solid rgba(248,81,73,.3);border-radius:8px;font-size:.85rem;color:var(--red)"></div>
+  </div>
+
+  <!-- Quick Info -->
+  <div class="card">
+    <div class="card-title"><span class="dot dot-green"></span>THRESHOLDS</div>
+    <div style="font-size:.88rem;line-height:2;color:var(--sub)">
+      <div>&#x1F493; Heart Rate: <b style="color:var(--text)">45 &ndash; 130 BPM</b></div>
+      <div>&#x1F321;&#xFE0F; Temperature: <b style="color:var(--text)">35.0 &ndash; 39.5 °C</b></div>
+      <div>&#x1F6B6; Free-fall: <b style="color:var(--text)">&lt; 3.0 m/s²</b></div>
+      <div>&#x1F4A5; Impact: <b style="color:var(--text)">&gt; 28.0 m/s²</b></div>
+      <div>&#x23F1;&#xFE0F; Inactivity: <b style="color:var(--text)">&lt; 10.5 m/s² for 1.5s</b></div>
+    </div>
+    <div style="margin-top:16px;font-size:.78rem;color:var(--sub)">Last updated: <span id="lastUpdate">--</span></div>
+  </div>
+
+</div>
+
+<footer>
+  <p>&#x26A0;&#xFE0F; This device is a monitoring aid &mdash; always contact emergency services (112/911) in a real emergency.</p>
+</footer>
+
+</div><!-- /container -->
+)rawliteral");
+
+  // ---------- JAVASCRIPT ----------
+  server.sendContent(R"rawliteral(
+<script>
+const BPM_MIN=45,BPM_MAX=130,TEMP_MIN=35.0,TEMP_MAX=39.5;
+const HISTORY=60;
+let bpmHistory=Array(HISTORY).fill(null);
+let tmpHistory=Array(HISTORY).fill(null);
+let alertCount=0;
+let lastFallTime='None';
+let startTime=Date.now();
+
+// ---- Canvas charts ----
+function drawChart(canvasId,data,color,minY,maxY,dangerLow,dangerHigh){
+  const c=document.getElementById(canvasId);
+  if(!c)return;
+  const W=c.offsetWidth||c.parentElement.offsetWidth||400;
+  const H=120;
+  c.width=W;c.height=H;
+  const ctx=c.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+
+  // Grid lines
+  ctx.strokeStyle='rgba(255,255,255,.05)';
+  ctx.lineWidth=1;
+  for(let i=1;i<4;i++){
+    const y=H*i/4;
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();
+  }
+
+  // Danger zones
+  const toY=v=>{
+    const range=maxY-minY||1;
+    return H - ((v-minY)/range)*H;
+  };
+  if(dangerHigh<maxY){
+    const y=toY(dangerHigh);
+    ctx.fillStyle='rgba(248,81,73,.07)';
+    ctx.fillRect(0,0,W,y);
+  }
+  if(dangerLow>minY){
+    const y=toY(dangerLow);
+    ctx.fillStyle='rgba(88,166,255,.07)';
+    ctx.fillRect(0,y,W,H-y);
+  }
+
+  // Dotted reference lines
+  ctx.setLineDash([4,4]);
+  ctx.strokeStyle='rgba(248,81,73,.35)';ctx.lineWidth=1;
+  if(dangerHigh<maxY){const y=toY(dangerHigh);ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+  ctx.strokeStyle='rgba(88,166,255,.35)';
+  if(dangerLow>minY){const y=toY(dangerLow);ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+  ctx.setLineDash([]);
+
+  // Line + fill
+  const valid=data.filter(v=>v!==null);
+  if(valid.length<2)return;
+  const pts=[];
+  const step=W/(HISTORY-1);
+  for(let i=0;i<HISTORY;i++){
+    if(data[i]===null)continue;
+    pts.push({x:i*step,y:toY(data[i])});
+  }
+
+  // Gradient fill
+  const grad=ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0,color.replace(')',',0.35)').replace('rgb','rgba'));
+  grad.addColorStop(1,color.replace(')',',0)').replace('rgb','rgba'));
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x,H);
+  pts.forEach(p=>ctx.lineTo(p.x,p.y));
+  ctx.lineTo(pts[pts.length-1].x,H);
+  ctx.closePath();
+  ctx.fillStyle=grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  pts.forEach((p,i)=>i===0?ctx.moveTo(p.x,p.y):ctx.lineTo(p.x,p.y));
+  ctx.strokeStyle=color;
+  ctx.lineWidth=2.2;
+  ctx.lineJoin='round';
+  ctx.stroke();
+
+  // Last point dot
+  if(pts.length>0){
+    const lp=pts[pts.length-1];
+    ctx.beginPath();
+    ctx.arc(lp.x,lp.y,4,0,Math.PI*2);
+    ctx.fillStyle=color;
+    ctx.fill();
+  }
+}
+
+// ---- Gauge ----
+function updateGauge(temp){
+  const arc=document.getElementById('gaugeArc');
+  const txt=document.getElementById('gaugeTxt');
+  if(!arc||!txt)return;
+  const circumference=2*Math.PI*54; // 339.3
+  const lo=34.0,hi=42.0;
+  const pct=Math.max(0,Math.min(1,(temp-lo)/(hi-lo)));
+  const offset=circumference*(1-pct);
+  arc.style.strokeDashoffset=offset;
+  if(temp<TEMP_MIN)arc.style.stroke='#58a6ff';
+  else if(temp>TEMP_MAX)arc.style.stroke='#f85149';
+  else arc.style.stroke='#3fb950';
+  txt.textContent=temp.toFixed(1);
+}
+
+// ---- Accel bars ----
+function setBar(id,val,max){
+  const pct=Math.min(100,Math.abs(val)/max*100);
+  document.getElementById(id).style.width=pct+'%';
+}
+
+// ---- Uptime ----
+function uptimeStr(){
+  const s=Math.floor((Date.now()-startTime)/1000);
+  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+}
+
+// ---- LED helpers ----
+function setLed(id,ok){
+  const el=document.getElementById(id);
+  if(el){el.className='s-led '+(ok?'on':'off');}
+}
+
+// ---- Main update ----
+async function fetchData(){
+  try{
+    const [dRes,hRes]=await Promise.all([
+      fetch('/api/data'),
+      fetch('/api/history')
+    ]);
+    const d=await dRes.json();
+    const h=await hRes.json();
+
+    // ----- BPM -----
+    const bpm=d.bpm||0;
+    document.getElementById('bpmVal').textContent=bpm>0?bpm:'--';
+    document.getElementById('statBpm').textContent=bpm>0?bpm+'':'--';
+    const hBadge=document.getElementById('heartBadge');
+    const hCard=document.getElementById('heartCard');
+    if(bpm>0){
+      if(bpm<BPM_MIN){hBadge.textContent='⬇ LOW';hBadge.className='badge badge-warn';hCard.classList.add('alert-card');}
+      else if(bpm>BPM_MAX){hBadge.textContent='⬆ HIGH';hBadge.className='badge badge-warn';hCard.classList.add('alert-card');}
+      else{hBadge.textContent='✓ Normal';hBadge.className='badge badge-ok';hCard.classList.remove('alert-card');}
+      // heart beating animation
+      document.getElementById('heartSvg').classList.add('beating');
+    }else{
+      hBadge.textContent='No Signal';hBadge.className='badge badge-idle';
+      document.getElementById('heartSvg').classList.remove('beating');
+      hCard.classList.remove('alert-card');
+    }
+
+    // ----- Temperature -----
+    const tmp=d.temp||0;
+    document.getElementById('tempVal').textContent=tmp>0?tmp.toFixed(1):'--';
+    document.getElementById('statTemp').textContent=tmp>0?tmp.toFixed(1):'--';
+    const tBadge=document.getElementById('tempBadge');
+    const tCard=document.getElementById('tempCard');
+    if(tmp>0){
+      updateGauge(tmp);
+      if(tmp<TEMP_MIN){tBadge.textContent='⬇ LOW TEMP';tBadge.className='badge badge-warn';tCard.classList.add('alert-card');}
+      else if(tmp>TEMP_MAX){tBadge.textContent='⬆ FEVER';tBadge.className='badge badge-warn';tCard.classList.add('alert-card');}
+      else{tBadge.textContent='✓ Normal';tBadge.className='badge badge-ok';tCard.classList.remove('alert-card');}
+    }else{
+      tBadge.textContent='No Signal';tBadge.className='badge badge-idle';
+    }
+
+    // ----- Fall -----
+    const fallCard=document.getElementById('fallCard');
+    const fallIcon=document.getElementById('fallIcon');
+    const fallBadge=document.getElementById('fallBadge');
+    const fallDot=document.getElementById('fallDot');
+    if(d.fall){
+      fallCard.classList.replace('fall-ok','fall-bad');
+      fallIcon.textContent='🆘';
+      fallBadge.textContent='FALL DETECTED!';
+      fallBadge.className='badge badge-warn';
+      fallDot.className='dot dot-red';
+      lastFallTime=new Date().toLocaleTimeString();
+      document.getElementById('statFall').textContent=lastFallTime;
+    }else{
+      fallCard.classList.replace('fall-bad','fall-ok');
+      fallIcon.textContent='🧍';
+      fallBadge.textContent='No Fall Detected';
+      fallBadge.className='badge badge-ok';
+      fallDot.className='dot dot-green';
+    }
+
+    // Accel bars (max 40 m/s²)
+    document.getElementById('valX').textContent=d.ax?d.ax.toFixed(2):'0.00';
+    document.getElementById('valY').textContent=d.ay?d.ay.toFixed(2):'0.00';
+    document.getElementById('valZ').textContent=d.az?d.az.toFixed(2):'0.00';
+    document.getElementById('valMag').textContent=d.amag?d.amag.toFixed(2):'0.00';
+    setBar('barX',d.ax||0,40);setBar('barY',d.ay||0,40);
+    setBar('barZ',d.az||0,40);setBar('barMag',d.amag||0,40);
+
+    // ----- Emergency -----
+    const em=document.getElementById('emergencyAlert');
+    if(d.emergency){
+      em.style.display='block';
+      alertCount++;
+      document.getElementById('statAlerts').textContent=alertCount;
+    }else{
+      em.style.display='none';
+    }
+
+    // ----- Sensor LEDs -----
+    setLed('ledHeart',d.heartbeatOk);
+    setLed('ledTemp',d.tempOk);
+    setLed('ledMpu',d.mpuOk);
+    setLed('ledWifi',d.wifiOk);
+    document.getElementById('stHeart').textContent=d.heartbeatOk?'Online':'Offline';
+    document.getElementById('stTemp').textContent=d.tempOk?'Online':'Offline';
+    document.getElementById('stMpu').textContent=d.mpuOk?'Online':'Offline';
+    document.getElementById('stWifi').textContent=d.wifiOk?'Connected':'Offline';
+
+    if(d.errorMsg&&d.errorMsg.length>0){
+      const eb=document.getElementById('errorBox');
+      eb.textContent='⚠ '+d.errorMsg;eb.style.display='block';
+    }else{
+      document.getElementById('errorBox').style.display='none';
+    }
+
+    // ----- History charts -----
+    if(h.bpm&&h.temp){
+      bpmHistory=h.bpm;
+      tmpHistory=h.temp;
+    }
+    const validBpm=bpmHistory.filter(v=>v>0);
+    const validTmp=tmpHistory.filter(v=>v>0);
+    const bMin=validBpm.length?Math.max(30,Math.min(...validBpm)-5):30;
+    const bMax=validBpm.length?Math.min(220,Math.max(...validBpm)+10):180;
+    const tMin=validTmp.length?Math.max(33,Math.min(...validTmp)-1):33;
+    const tMax=validTmp.length?Math.min(42,Math.max(...validTmp)+1):42;
+
+    drawChart('bpmChart',bpmHistory,'rgb(248,81,73)',bMin,bMax,BPM_MIN,BPM_MAX);
+    drawChart('tempChart',tmpHistory,'rgb(88,166,255)',tMin,tMax,TEMP_MIN,TEMP_MAX);
+
+    document.getElementById('bpmRange').textContent=validBpm.length?`${Math.min(...validBpm).toFixed(0)}–${Math.max(...validBpm).toFixed(0)} BPM`:'';
+    document.getElementById('tempRange').textContent=validTmp.length?`${Math.min(...validTmp).toFixed(1)}–${Math.max(...validTmp).toFixed(1)} °C`:'';
+
+    document.getElementById('lastUpdate').textContent=new Date().toLocaleTimeString();
+    document.getElementById('uptimeVal').textContent=uptimeStr();
+
+  }catch(e){console.error('[Dashboard]',e);}
+}
+
+function requestHelp(){
+  fetch('/api/need_assistance',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.success){
+      document.getElementById('emergencyAlert').style.display='none';
+      alert('Help request sent! Emergency services have been notified.');
+    }
+  }).catch(e=>console.error(e));
+}
+
+function clearEmergency(){
+  fetch('/api/clear_emergency',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.success) document.getElementById('emergencyAlert').style.display='none';
+  }).catch(e=>console.error(e));
+}
+
+// Poll every 1.2 s, redraw charts on resize
+setInterval(fetchData,1200);
+window.addEventListener('resize',()=>{
+  drawChart('bpmChart',bpmHistory,'rgb(248,81,73)',30,180,BPM_MIN,BPM_MAX);
+  drawChart('tempChart',tmpHistory,'rgb(88,166,255)',33,42,TEMP_MIN,TEMP_MAX);
+});
+fetchData();
+</script>
 </body>
 </html>
-)rawliteral";
-  server.send(200, "text/html", html);
+)rawliteral");
 }
 
-// ==================== API HANDLERS ====================
+// ==================== API: /api/data ====================
 void handleAPIData() {
   StaticJsonDocument<512> doc;
-  
-  doc["bpm"] = (status.heartbeatOk && sensor.heartRate > 0) ? round(sensor.heartRate) : 0;
-  doc["temp"] = (status.tempOk && sensor.temperature > -50) ? sensor.temperature : 0;
-  doc["fall"] = sensor.fallDetected;
-  doc["emergency"] = sensor.emergencyActive;
-  doc["heartbeatOk"] = status.heartbeatOk;
-  doc["tempOk"] = status.tempOk;
-  doc["mpuOk"] = status.mpuOk;
-  doc["wifiOk"] = status.wifiOk;
-  doc["errorMsg"] = status.errorMessages;
-  
-  String response;
-  serializeJson(doc, response);
-  server.send(200, "application/json", response);
+  doc["bpm"]         = (sensorStatus.heartbeatOk && sensor.heartRate > 0) ? (int)round(sensor.heartRate) : 0;
+  doc["temp"]        = (sensorStatus.tempOk && sensor.temperature > -50.0f) ? sensor.temperature : 0.0f;
+  doc["fall"]        = sensor.fallDetected;
+  doc["emergency"]   = sensor.emergencyActive;
+  doc["heartbeatOk"] = sensorStatus.heartbeatOk;
+  doc["tempOk"]      = sensorStatus.tempOk;
+  doc["mpuOk"]       = sensorStatus.mpuOk;
+  doc["wifiOk"]      = sensorStatus.wifiOk;
+  doc["errorMsg"]    = sensorStatus.errorMessages;
+  doc["ax"]          = sensor.accelX;
+  doc["ay"]          = sensor.accelY;
+  doc["az"]          = sensor.accelZ;
+  doc["amag"]        = sensor.accelMag;
+  doc["uptime"]      = (millis() - systemStartTime) / 1000;
+  doc["alerts"]      = totalAlerts;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
+// ==================== API: /api/history ====================
+void handleAPIHistory() {
+  // Build compact JSON arrays for the graph
+  String bpmArr = "[";
+  String tmpArr = "[";
+
+  int start = (history.count < HISTORY_SIZE) ? 0 : history.head;
+  for (int i = 0; i < history.count; i++) {
+    int idx = (start + i) % HISTORY_SIZE;
+    if (i > 0) { bpmArr += ","; tmpArr += ","; }
+    if (history.bpm[idx] > 0)  bpmArr += String((int)history.bpm[idx]);
+    else                       bpmArr += "null";
+    if (history.temp[idx] > 0) tmpArr += String(history.temp[idx], 1);
+    else                       tmpArr += "null";
+  }
+  bpmArr += "]";
+  tmpArr += "]";
+
+  server.send(200, "application/json", "{\"bpm\":" + bpmArr + ",\"temp\":" + tmpArr + "}");
+}
+
+// ==================== API: Assistance / Clear ====================
 void handleNeedAssistance() {
   Serial.println("[ALERT] PATIENT REQUESTED MEDICAL ASSISTANCE!");
   sensor.emergencyActive = true;
-  
-  StaticJsonDocument<64> doc;
-  doc["success"] = true;
-  String response;
-  serializeJson(doc, response);
-  server.send(200, "application/json", response);
+  totalAlerts++;
+  server.send(200, "application/json", "{\"success\":true}");
 }
 
 void handleClearEmergency() {
   sensor.emergencyActive = false;
-  sensor.fallDetected = false;
-  status.errorMessages = "";
-  Serial.println("[INFO] Emergency cleared by user response");
-  
-  StaticJsonDocument<64> doc;
-  doc["success"] = true;
-  String response;
-  serializeJson(doc, response);
-  server.send(200, "application/json", response);
+  sensor.fallDetected    = false;
+  fallState              = FALL_IDLE;
+  sensorStatus.errorMessages = "";
+  Serial.println("[INFO] Emergency cleared by user.");
+  server.send(200, "application/json", "{\"success\":true}");
 }
 
 void setupWebServer() {
-  server.on("/", handleRoot);
-  server.on("/api/data", handleAPIData);
+  server.on("/",                    handleRoot);
+  server.on("/api/data",            handleAPIData);
+  server.on("/api/history",         handleAPIHistory);
   server.on("/api/need_assistance", HTTP_POST, handleNeedAssistance);
   server.on("/api/clear_emergency", HTTP_POST, handleClearEmergency);
   server.begin();
-  Serial.println("[INFO] Web server started");
+  Serial.println("[Web] Server started");
 }
 
-// ==================== SENSOR READING TASK ====================
+// ==================== SENSOR LOOP ====================
 void readAllSensors() {
   unsigned long now = millis();
-  
-  // Process heartbeat
+
+  // --- Heartbeat ---
   if (newBeatAvailable) {
     float newBPM = calculateBPM();
     if (newBPM > 0) {
       sensor.heartRate = newBPM;
-      status.heartbeatOk = true;
+      sensorStatus.heartbeatOk = true;
       lastHeartbeatTime = now;
     }
     newBeatAvailable = false;
-  } else if (now - lastHeartbeatTime > 3000) {
-    // No heartbeat detected for 3 seconds
-    if (status.heartbeatOk) {
-      status.heartbeatOk = false;
-      Serial.println("[WARN] Heartbeat signal lost - check sensor placement");
+  } else if (now - lastHeartbeatTime > 3500) {
+    if (sensorStatus.heartbeatOk) {
+      sensorStatus.heartbeatOk = false;
+      Serial.println("[WARN] Heartbeat signal lost – check sensor.");
     }
   }
-  
-  // Read temperature every 2 seconds
+
+  // --- Temperature (every 2 s) ---
   static unsigned long lastTempRead = 0;
   if (now - lastTempRead >= 2000) {
     sensor.temperature = readTemperature();
     lastTempRead = now;
   }
-  
-  // Update fall detection
+
+  // --- Fall detection ---
   updateFallDetection();
-  
-  // Check for emergencies
+
+  // --- Emergency check ---
   checkEmergencyConditions();
+
+  // --- Push to history every 1 s ---
+  if (now - lastHistoryPush >= 1000) {
+    float b = (sensorStatus.heartbeatOk && sensor.heartRate > 0) ? sensor.heartRate : 0;
+    float t = (sensorStatus.tempOk && sensor.temperature > -50.0f) ? sensor.temperature : 0;
+    history.push(b, t);
+    lastHistoryPush = now;
+  }
 }
 
-// ==================== SERIAL DEBUG OUTPUT ====================
-void serialDebugOutput() {
-  static unsigned long lastOutput = 0;
+// ==================== SERIAL DEBUG ====================
+void serialDebug() {
+  static unsigned long last = 0;
   unsigned long now = millis();
-  
-  if (now - lastOutput >= 3000) {
-    Serial.println("\n===============================================");
-    Serial.println("     IoT HEALTH MONITOR - LIVE DATA");
-    Serial.println("===============================================");
-    
-    // Heart Rate
-    Serial.print("Heart Rate: ");
-    if (status.heartbeatOk && sensor.heartRate > 0) {
-      Serial.printf("%5.0f BPM", sensor.heartRate);
-      if (sensor.heartRate < HEART_RATE_MIN) Serial.print(" [LOW]");
-      else if (sensor.heartRate > HEART_RATE_MAX) Serial.print(" [HIGH]");
-      else Serial.print(" [NORMAL]");
-    } else {
-      Serial.print("   -- BPM (No Signal)");
-    }
-    Serial.println();
-    
-    // Temperature
-    Serial.print("Temperature: ");
-    if (status.tempOk && sensor.temperature > -50) {
-      Serial.printf("%5.1f C", sensor.temperature);
-      if (sensor.temperature < TEMP_MIN) Serial.print(" [LOW]");
-      else if (sensor.temperature > TEMP_MAX) Serial.print(" [HIGH]");
-      else Serial.print(" [NORMAL]");
-    } else {
-      Serial.print("    -- C (Sensor Error)");
-    }
-    Serial.println();
-    
-    // Accelerometer
-    Serial.printf("Accelerometer: X=%6.2f  Y=%6.2f  Z=%6.2f m/s^2\n", 
-                  sensor.accelX, sensor.accelY, sensor.accelZ);
-    
-    // Fall Status
-    Serial.print("Fall Status: ");
-    if (sensor.fallDetected) {
-      Serial.print("FALL DETECTED!");
-    } else {
-      Serial.print("No Fall Detected");
-    }
-    Serial.println();
-    
-    // Emergency Status
-    Serial.print("Emergency: ");
-    if (sensor.emergencyActive) {
-      Serial.print("ACTIVE - Medical assistance may be needed");
-    } else {
-      Serial.print("No Active Emergencies");
-    }
-    Serial.println();
-    
-    // WiFi Status
-    Serial.print("WiFi: ");
-    Serial.print(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
-    Serial.print(" | IP: ");
-    Serial.println(WiFi.localIP());
-    
-    Serial.println("===============================================\n");
-    lastOutput = now;
-  }
+  if (now - last < 4000) return;
+  last = now;
+
+  Serial.println("\n============ HEALTH MONITOR ============");
+  Serial.printf("Heart Rate  : %5.0f BPM  [%s]\n",
+    sensor.heartRate, sensorStatus.heartbeatOk ? "OK" : "NO SIGNAL");
+  Serial.printf("Temperature : %5.1f C    [%s]\n",
+    sensor.temperature, sensorStatus.tempOk ? "OK" : "ERROR");
+  Serial.printf("Accel Mag   : %5.2f m/s²\n", sensor.accelMag);
+  Serial.printf("Fall State  : %d  Detected: %s\n",
+    (int)fallState, sensor.fallDetected ? "YES" : "No");
+  Serial.printf("Emergency   : %s\n", sensor.emergencyActive ? "ACTIVE" : "None");
+  Serial.printf("WiFi        : %s  IP: %s\n",
+    WiFi.status()==WL_CONNECTED?"Connected":"Offline",
+    WiFi.localIP().toString().c_str());
+  Serial.println("========================================\n");
 }
 
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
-  delay(100);
-  Serial.println("\n\n========================================");
-  Serial.println("IoT Health Monitoring System Starting...");
+  delay(150);
+  Serial.println("\n========================================");
+  Serial.println("  IoT Health Monitoring System v2.0");
   Serial.println("========================================\n");
-  
-  // Initialize Heartbeat Sensor (GPIO34)
+
+  systemStartTime = millis();
+
+  // Heartbeat ISR
   pinMode(HEARTBEAT_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(HEARTBEAT_PIN), heartbeatISR, RISING);
-  Serial.println("[OK] Heartbeat sensor initialized on GPIO34");
-  
-  // Initialize DS18B20
+  Serial.println("[OK] Heartbeat sensor on GPIO34");
+
+  // DS18B20
   pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
-
   ds18b20.begin();
+  Serial.println("[OK] DS18B20 on GPIO4");
 
-  Serial.println("[OK] DS18B20 initialized on GPIO4 with internal pullup");
-  
-  // Initialize MPU6050
+  // MPU6050
   if (!initMPU6050()) {
-    Serial.println("[WARN] MPU6050 not detected - fall detection disabled");
+    Serial.println("[WARN] MPU6050 not found – fall detection disabled.");
   }
-  
-  // Connect to WiFi
-  Serial.printf("\n[WiFi] Connecting to %s", ssid);
+
+  // WiFi
+  Serial.printf("[WiFi] Connecting to %s", ssid);
   WiFi.begin(ssid, password);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries++ < 40) {
+    delay(500); Serial.print(".");
   }
-  
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WiFi] Connected successfully!");
-    Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
-    status.wifiOk = true;
+    Serial.printf("\n[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    sensorStatus.wifiOk = true;
   } else {
-    Serial.println("\n[WiFi] Failed to connect! Check credentials.");
-    status.wifiOk = false;
+    Serial.println("\n[WiFi] Failed – will retry in loop.");
   }
-  
-  // Setup Web Server
+
   setupWebServer();
-  
-  Serial.println("\n[OK] System ready!");
-  Serial.println("[INFO] Access the dashboard at: http://" + WiFi.localIP().toString());
-  Serial.println("[INFO] Monitoring started...\n");
+
+  Serial.println("\n[OK] System ready.");
+  Serial.printf("[INFO] Dashboard: http://%s\n\n", WiFi.localIP().toString().c_str());
 }
 
 // ==================== LOOP ====================
 void loop() {
-  static unsigned long lastSensorRead = 0;
+  static unsigned long lastRead    = 0;
+  static unsigned long lastWifiChk = 0;
   unsigned long now = millis();
-  
-  // Read sensors every 100ms
-  if (now - lastSensorRead >= 100) {
+
+  // Sensors at 100 ms cadence
+  if (now - lastRead >= 100) {
     readAllSensors();
-    lastSensorRead = now;
+    lastRead = now;
   }
-  
-  // Handle web requests
+
+  // Web server
   server.handleClient();
-  
-  // Serial debugging output
-  serialDebugOutput();
-  
-  delay(10);  // Small delay for stability
+
+  // WiFi watchdog every 30 s
+  if (now - lastWifiChk >= 30000) {
+    maintainWiFi();
+    lastWifiChk = now;
+  }
+
+  // Serial debug
+  serialDebug();
+
+  delay(5);
 }
