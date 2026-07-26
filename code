@@ -1,0 +1,952 @@
+/*
+ * Complete IoT Health Monitoring System for ESP32
+ * Sensors: HW-827 (Heartbeat), DS18B20 (Temperature), MPU6050 (Accelerometer/Gyroscope)
+ * Features: Live Web Dashboard, Fall Detection, Emergency Alerts
+ * 
+ * Pin Connections:
+ * - Heartbeat Sensor (HW-827)  -> GPIO34 (ADC)
+ * - DS18B20 Temperature Sensor  -> GPIO4 (OneWire)
+ * - MPU6050 I2C SDA            -> GPIO21
+ * - MPU6050 I2C SCL            -> GPIO22
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <MPU6050_tockn.h>
+#include <ArduinoJson.h>
+#include <Ticker.h>
+
+// ==================== CONFIGURATION ====================
+// WiFi Credentials - UPDATE THESE
+const char* ssid = "Airtel_FREJ_RAJ-5G";        // Change this
+const char* password = "lmipG#132@";
+
+// Medical Thresholds
+const int HEART_RATE_MIN = 50;      // Bradycardia threshold (BPM)
+const int HEART_RATE_MAX = 120;     // Tachycardia threshold (BPM)
+const float TEMP_MIN = 36.0;        // Hypothermia threshold (C)
+const float TEMP_MAX = 38.5;        // Fever threshold (C)
+
+// Fall detection parameters
+const float FALL_ACCEL_THRESHOLD = 24.0;  // m/s^2 - typical fall > 2.5g
+const unsigned long FALL_RECOVERY_TIME = 5000;  // ms before auto-clearing fall
+const unsigned long EMERGENCY_COOLDOWN = 30000; // ms between emergency alerts
+
+// Smoothing filters
+const int BPM_SAMPLE_SIZE = 10;
+const int TEMP_SAMPLE_SIZE = 5;
+
+// ==================== PIN DEFINITIONS ====================
+#define HEARTBEAT_PIN 34        // GPIO34 for HW-827 analog output
+#define ONE_WIRE_BUS 4          // GPIO4 for DS18B20
+
+// ==================== GLOBAL OBJECTS ====================
+WebServer server(80);
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18b20(&oneWire);
+MPU6050 mpu(Wire);
+Ticker sensorTicker;
+
+// ==================== DATA STRUCTURES ====================
+struct SensorData {
+  float heartRate = 0.0;
+  float temperature = 0.0;
+  bool fallDetected = false;
+  bool emergencyActive = false;
+  float accelX = 0, accelY = 0, accelZ = 0;
+  float gyroX = 0, gyroY = 0, gyroZ = 0;
+  unsigned long lastUpdate = 0;
+};
+
+struct SensorStatus {
+  bool heartbeatOk = false;
+  bool tempOk = false;
+  bool mpuOk = false;
+  bool wifiOk = false;
+  String errorMessages = "";
+};
+
+// ==================== GLOBAL VARIABLES ====================
+SensorData sensor;
+SensorStatus status;
+
+// Heartbeat timing
+volatile unsigned long lastBeatTime = 0;
+volatile int beatInterval = 0;
+volatile bool newBeatAvailable = false;
+int bpmBuffer[BPM_SAMPLE_SIZE] = {0};
+int bpmBufferIndex = 0;
+float tempBuffer[TEMP_SAMPLE_SIZE] = {0};
+int tempBufferIndex = 0;
+
+// Emergency timing
+unsigned long lastHeartAlert = 0;
+unsigned long lastTempAlert = 0;
+unsigned long lastFallAlert = 0;
+unsigned long lastEmergencyTime = 0;
+
+// System state
+unsigned long lastSerialOutput = 0;
+unsigned long lastSensorRead = 0;
+unsigned long lastHeartbeatTime = 0;
+
+// ==================== HEARTBEAT SENSOR HANDLER ====================
+void IRAM_ATTR heartbeatISR() {
+  unsigned long now = micros();
+  static unsigned long lastDebounceTime = 0;
+  
+  // Debounce: ignore pulses within 250ms
+  if ((now - lastDebounceTime) > 250000) {
+    beatInterval = now - lastBeatTime;
+    lastBeatTime = now;
+    newBeatAvailable = true;
+    lastDebounceTime = now;
+  }
+}
+
+// Calculate BPM from beat intervals
+float calculateBPM() {
+  if (beatInterval > 0 && beatInterval < 2000000) {  // Valid between 30-300 BPM
+    float instantBPM = 60000000.0 / beatInterval;
+    if (instantBPM >= 30 && instantBPM <= 250) {
+      // Moving average filter
+      bpmBuffer[bpmBufferIndex] = (int)instantBPM;
+      bpmBufferIndex = (bpmBufferIndex + 1) % BPM_SAMPLE_SIZE;
+      
+      int sum = 0;
+      int count = 0;
+      for (int i = 0; i < BPM_SAMPLE_SIZE; i++) {
+        if (bpmBuffer[i] > 0) {
+          sum += bpmBuffer[i];
+          count++;
+        }
+      }
+      return (count > 0) ? (float)(sum / count) : 0;
+    }
+  }
+  return sensor.heartRate;  // Return last valid value
+}
+
+// ==================== TEMPERATURE SENSOR ====================
+float readTemperature() {
+  ds18b20.requestTemperatures();
+  float temp = ds18b20.getTempCByIndex(0);
+  
+  if (temp == DEVICE_DISCONNECTED_C || temp < -20 || temp > 100) {
+    status.tempOk = false;
+    status.errorMessages = "DS18B20 not detected!";
+    Serial.println("[ERROR] Temperature sensor not found!");
+    return sensor.temperature;  // Return last valid value
+  }
+  
+  // Moving average filter
+  tempBuffer[tempBufferIndex] = temp;
+  tempBufferIndex = (tempBufferIndex + 1) % TEMP_SAMPLE_SIZE;
+  
+  float sum = 0;
+  int count = 0;
+  for (int i = 0; i < TEMP_SAMPLE_SIZE; i++) {
+    if (tempBuffer[i] > -50) {
+      sum += tempBuffer[i];
+      count++;
+    }
+  }
+  
+  status.tempOk = true;
+  return (count > 0) ? (sum / count) : temp;
+}
+
+// ==================== MPU6050 INITIALIZATION ====================
+bool initMPU6050() {
+  Wire.begin(21, 22);  // SDA=GPIO21, SCL=GPIO22
+  Wire.setClock(400000);
+  delay(100);
+  
+  mpu.begin();
+  mpu.calcGyroOffsets(true);
+  delay(1000);
+  
+  status.mpuOk = true;
+  Serial.println("[INFO] MPU6050 initialized successfully");
+  return true;
+}
+
+// ==================== FALL DETECTION ====================
+void updateFallDetection() {
+  if (!status.mpuOk) return;
+  
+  mpu.update();  // Read latest data
+  
+  sensor.accelX = mpu.getAccX();
+  sensor.accelY = mpu.getAccY();
+  sensor.accelZ = mpu.getAccZ();
+  sensor.gyroX = mpu.getGyroX();
+  sensor.gyroY = mpu.getGyroY();
+  sensor.gyroZ = mpu.getGyroZ();
+  
+  // Calculate total acceleration magnitude
+  float accelMagnitude = sqrt(
+    sq(sensor.accelX) + 
+    sq(sensor.accelY) + 
+    sq(sensor.accelZ)
+  );
+  
+  // Fall detection logic
+  static unsigned long impactTime = 0;
+  static bool potentialFall = false;
+  
+  if (accelMagnitude > FALL_ACCEL_THRESHOLD && !sensor.fallDetected) {
+    if (!potentialFall) {
+      potentialFall = true;
+      impactTime = millis();
+      Serial.printf("[FALL] Impact detected! Magnitude: %.2f m/s^2\n", accelMagnitude);
+    }
+  }
+  
+  // Check for post-fall inactivity (lying still)
+  if (potentialFall && !sensor.fallDetected) {
+    unsigned long timeSinceImpact = millis() - impactTime;
+    if (timeSinceImpact > 1000 && accelMagnitude < 11.0) {  // < 1.1g for 1 second
+      sensor.fallDetected = true;
+      sensor.emergencyActive = true;
+      potentialFall = false;
+      Serial.println("[ALERT] FALL DETECTED! Medical assistance may be needed!");
+    } else if (timeSinceImpact > 3000 && accelMagnitude > 15.0) {
+      // False alarm - person moved quickly after impact
+      potentialFall = false;
+      Serial.println("[INFO] Fall impact detected but person moved - probable false alarm");
+    }
+  }
+  
+  // Auto-clear fall after recovery time
+  if (sensor.fallDetected && (millis() - impactTime) > FALL_RECOVERY_TIME) {
+    sensor.fallDetected = false;
+    Serial.println("[INFO] Fall alert auto-cleared after recovery period");
+  }
+}
+
+// ==================== EMERGENCY CHECKING ====================
+void checkEmergencyConditions() {
+  unsigned long now = millis();
+  bool newEmergency = false;
+  String emergencyReason = "";
+  
+  // Heart rate check
+  if (status.heartbeatOk && sensor.heartRate > 0) {
+    if (sensor.heartRate < HEART_RATE_MIN) {
+      if (now - lastHeartAlert > EMERGENCY_COOLDOWN) {
+        newEmergency = true;
+        emergencyReason = "LOW HEART RATE: " + String(sensor.heartRate, 0) + " BPM";
+        lastHeartAlert = now;
+      }
+    } else if (sensor.heartRate > HEART_RATE_MAX) {
+      if (now - lastHeartAlert > EMERGENCY_COOLDOWN) {
+        newEmergency = true;
+        emergencyReason = "HIGH HEART RATE: " + String(sensor.heartRate, 0) + " BPM";
+        lastHeartAlert = now;
+      }
+    }
+  }
+  
+  // Temperature check
+  if (status.tempOk && sensor.temperature > -50) {
+    if (sensor.temperature < TEMP_MIN) {
+      if (now - lastTempAlert > EMERGENCY_COOLDOWN) {
+        newEmergency = true;
+        emergencyReason = "LOW TEMPERATURE: " + String(sensor.temperature, 1) + "C";
+        lastTempAlert = now;
+      }
+    } else if (sensor.temperature > TEMP_MAX) {
+      if (now - lastTempAlert > EMERGENCY_COOLDOWN) {
+        newEmergency = true;
+        emergencyReason = "HIGH TEMPERATURE: " + String(sensor.temperature, 1) + "C";
+        lastTempAlert = now;
+      }
+    }
+  }
+  
+  // Fall check
+  if (sensor.fallDetected && (now - lastFallAlert > EMERGENCY_COOLDOWN)) {
+    newEmergency = true;
+    emergencyReason = "FALL DETECTED - Person may be injured!";
+    lastFallAlert = now;
+  }
+  
+  if (newEmergency) {
+    sensor.emergencyActive = true;
+    lastEmergencyTime = now;
+    Serial.println("\n!!! MEDICAL EMERGENCY !!!");
+    Serial.println(emergencyReason);
+    Serial.println("!!! PLEASE CHECK ON PATIENT IMMEDIATELY !!!\n");
+  }
+  
+  // Auto-clear emergencies after cooldown if vitals normalize
+  if (sensor.emergencyActive && !sensor.fallDetected && (now - lastEmergencyTime > EMERGENCY_COOLDOWN)) {
+    bool vitalsNormal = true;
+    if (status.heartbeatOk && sensor.heartRate > 0) {
+      vitalsNormal &= (sensor.heartRate >= HEART_RATE_MIN && sensor.heartRate <= HEART_RATE_MAX);
+    }
+    if (status.tempOk && sensor.temperature > -50) {
+      vitalsNormal &= (sensor.temperature >= TEMP_MIN && sensor.temperature <= TEMP_MAX);
+    }
+    
+    if (vitalsNormal) {
+      sensor.emergencyActive = false;
+      Serial.println("[INFO] Emergency cleared - vitals have normalized");
+    }
+  }
+}
+
+// ==================== WEB SERVER - HTML DASHBOARD ====================
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>Medical Monitor - Health Alert System</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', 'Roboto', 'Helvetica Neue', sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1300px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+        
+        .header h1 {
+            font-size: 2.2rem;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .header p {
+            font-size: 1rem;
+            opacity: 0.9;
+        }
+        
+        /* Emergency Banner */
+        .emergency-banner {
+            background: linear-gradient(135deg, #ff0844 0%, #ffb199 100%);
+            border-radius: 20px;
+            padding: 25px;
+            margin-bottom: 25px;
+            text-align: center;
+            animation: pulse 0.8s ease-in-out infinite;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }
+        
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.02); }
+        }
+        
+        .emergency-banner h2 {
+            color: white;
+            font-size: 1.8rem;
+            margin-bottom: 15px;
+        }
+        
+        .warning-text {
+            color: white;
+            font-size: 1.4rem;
+            font-weight: bold;
+            margin: 15px 0;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        
+        .emergency-banner button {
+            background: white;
+            color: #ff0844;
+            border: none;
+            padding: 12px 30px;
+            font-size: 1.1rem;
+            font-weight: bold;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin: 5px;
+        }
+        
+        .emergency-banner button:hover {
+            transform: scale(1.05);
+            box-shadow: 0 5px 20px rgba(0,0,0,0.2);
+        }
+        
+        .btn-help {
+            background: #ff0844;
+            color: white !important;
+        }
+        
+        /* Dashboard Cards */
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 25px;
+            margin-bottom: 25px;
+        }
+        
+        .card {
+            background: rgba(255,255,255,0.95);
+            border-radius: 20px;
+            padding: 25px;
+            backdrop-filter: blur(10px);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }
+        
+        .card h3 {
+            color: #2a5298;
+            font-size: 1.5rem;
+            margin-bottom: 20px;
+            border-left: 4px solid #2a5298;
+            padding-left: 15px;
+        }
+        
+        .reading {
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .value {
+            font-size: 4rem;
+            font-weight: bold;
+            color: #1e3c72;
+        }
+        
+        .unit {
+            font-size: 1.2rem;
+            color: #666;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 8px 20px;
+            border-radius: 50px;
+            font-weight: bold;
+            margin-top: 15px;
+        }
+        
+        .normal {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .warning {
+            background: #f8d7da;
+            color: #721c24;
+            animation: blink 1s infinite;
+        }
+        
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        
+        /* Sensor Status Panel */
+        .status-panel {
+            background: rgba(255,255,255,0.95);
+            border-radius: 20px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        
+        .status-panel h3 {
+            color: #2a5298;
+            margin-bottom: 15px;
+        }
+        
+        .sensor-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        
+        .sensor-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background: #f8f9fa;
+            border-radius: 10px;
+        }
+        
+        .sensor-status-led {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        
+        .online { background: #28a745; box-shadow: 0 0 5px #28a745; }
+        .offline { background: #dc3545; box-shadow: 0 0 5px #dc3545; }
+        
+        .error-message {
+            color: #dc3545;
+            font-size: 0.9rem;
+            margin-top: 10px;
+            padding: 10px;
+            background: #f8d7da;
+            border-radius: 10px;
+        }
+        
+        footer {
+            text-align: center;
+            color: white;
+            margin-top: 30px;
+            font-size: 0.85rem;
+            opacity: 0.8;
+        }
+        
+        @media (max-width: 768px) {
+            .value { font-size: 2.5rem; }
+            .header h1 { font-size: 1.5rem; }
+            .warning-text { font-size: 1rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1> IoT Health Monitoring System</h1>
+            <p>Real-time Medical Alert System | 24/7 Patient Monitoring</p>
+        </div>
+        
+        <div id="emergencyAlert" style="display: none;">
+            <div class="emergency-banner">
+                <h2> MEDICAL EMERGENCY </h2>
+                <div class="warning-text" id="emergencyMessage">ARE YOU IN NEED OF MEDICAL ASSISTANCE?</div>
+                <button class="btn-help" onclick="requestHelp()"> I NEED ASSISTANCE - CALL FOR HELP</button>
+                <button onclick="clearEmergency()"> I AM OKAY - NO HELP NEEDED</button>
+            </div>
+        </div>
+        
+        <div class="dashboard">
+            <div class="card">
+                <h3> Heart Rate</h3>
+                <div class="reading">
+                    <div class="value"><span id="bpm">--</span><span class="unit"> BPM</span></div>
+                    <div id="heartStatus" class="status-badge normal">Monitoring</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3> Body Temperature</h3>
+                <div class="reading">
+                    <div class="value"><span id="temp">--</span><span class="unit"> C</span></div>
+                    <div id="tempStatus" class="status-badge normal">Monitoring</div>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3> Fall Detection</h3>
+                <div class="reading">
+                    <div class="value" id="fallStatus"> No Fall</div>
+                    <div id="fallDetail" class="status-badge normal">Patient stable</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="status-panel">
+            <h3> System Status</h3>
+            <div class="sensor-grid">
+                <div class="sensor-item">
+                    <span class="sensor-status-led" id="heartbeatLed"></span>
+                    <span>Heartbeat Sensor: <span id="heartbeatStatus">--</span></span>
+                </div>
+                <div class="sensor-item">
+                    <span class="sensor-status-led" id="tempLed"></span>
+                    <span>Temperature Sensor: <span id="tempSensorStatus">--</span></span>
+                </div>
+                <div class="sensor-item">
+                    <span class="sensor-status-led" id="mpuLed"></span>
+                    <span>Motion Sensor: <span id="mpuStatus">--</span></span>
+                </div>
+                <div class="sensor-item">
+                    <span class="sensor-status-led" id="wifiLed"></span>
+                    <span>WiFi: <span id="wifiStatus">--</span></span>
+                </div>
+            </div>
+            <div id="errorMessages" class="error-message" style="display: none;"></div>
+        </div>
+        
+        <footer>
+            <p>This is a medical monitoring device. In case of real emergency, contact emergency services immediately.</p>
+            <p>Last update: <span id="lastUpdate">--</span></p>
+        </footer>
+    </div>
+    
+    <script>
+        function updateDashboard() {
+            fetch('/api/data')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('bpm').innerText = data.bpm || '--';
+                    const heartStatus = document.getElementById('heartStatus');
+                    if (data.bpm > 0) {
+                        if (data.bpm < 50) {
+                            heartStatus.innerText = ' LOW HEART RATE';
+                            heartStatus.className = 'status-badge warning';
+                        } else if (data.bpm > 120) {
+                            heartStatus.innerText = ' HIGH HEART RATE';
+                            heartStatus.className = 'status-badge warning';
+                        } else {
+                            heartStatus.innerText = ' Normal Range';
+                            heartStatus.className = 'status-badge normal';
+                        }
+                    }
+                    
+                    document.getElementById('temp').innerText = data.temp ? data.temp.toFixed(1) : '--';
+                    const tempStatus = document.getElementById('tempStatus');
+                    if (data.temp) {
+                        if (data.temp < 36.0) {
+                            tempStatus.innerText = ' LOW TEMPERATURE';
+                            tempStatus.className = 'status-badge warning';
+                        } else if (data.temp > 38.5) {
+                            tempStatus.innerText = ' HIGH TEMPERATURE';
+                            tempStatus.className = 'status-badge warning';
+                        } else {
+                            tempStatus.innerText = ' Normal Range';
+                            tempStatus.className = 'status-badge normal';
+                        }
+                    }
+                    
+                    const fallElement = document.getElementById('fallStatus');
+                    const fallDetail = document.getElementById('fallDetail');
+                    if (data.fall) {
+                        fallElement.innerHTML = ' FALL DETECTED!';
+                        fallDetail.innerText = ' IMMEDIATE ATTENTION NEEDED!';
+                        fallDetail.className = 'status-badge warning';
+                    } else {
+                        fallElement.innerHTML = ' No Fall Detected';
+                        fallDetail.innerText = ' Patient stable';
+                        fallDetail.className = 'status-badge normal';
+                    }
+                    
+                    const emergencyDiv = document.getElementById('emergencyAlert');
+                    if (data.emergency) {
+                        emergencyDiv.style.display = 'block';
+                    } else {
+                        emergencyDiv.style.display = 'none';
+                    }
+                    
+                    updateSensorLed('heartbeatLed', data.heartbeatOk);
+                    document.getElementById('heartbeatStatus').innerText = data.heartbeatOk ? 'Online' : 'Offline';
+                    
+                    updateSensorLed('tempLed', data.tempOk);
+                    document.getElementById('tempSensorStatus').innerText = data.tempOk ? 'Online' : 'Offline';
+                    
+                    updateSensorLed('mpuLed', data.mpuOk);
+                    document.getElementById('mpuStatus').innerText = data.mpuOk ? 'Online' : 'Offline';
+                    
+                    updateSensorLed('wifiLed', data.wifiOk);
+                    document.getElementById('wifiStatus').innerText = data.wifiOk ? 'Connected' : 'Disconnected';
+                    
+                    if (data.errorMsg && data.errorMsg.length > 0) {
+                        const errorDiv = document.getElementById('errorMessages');
+                        errorDiv.innerText = ' ' + data.errorMsg;
+                        errorDiv.style.display = 'block';
+                    } else {
+                        document.getElementById('errorMessages').style.display = 'none';
+                    }
+                    
+                    document.getElementById('lastUpdate').innerText = new Date().toLocaleTimeString();
+                })
+                .catch(error => {
+                    console.error('Error fetching data:', error);
+                });
+        }
+        
+        function updateSensorLed(elementId, isOk) {
+            const led = document.getElementById(elementId);
+            if (isOk) {
+                led.className = 'sensor-status-led online';
+            } else {
+                led.className = 'sensor-status-led offline';
+            }
+        }
+        
+        function requestHelp() {
+            fetch('/api/need_assistance', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert("Help request sent! Emergency services have been notified.");
+                        document.getElementById('emergencyAlert').style.display = 'none';
+                    }
+                })
+                .catch(error => console.error('Error:', error));
+        }
+        
+        function clearEmergency() {
+            fetch('/api/clear_emergency', { method: 'POST' })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        document.getElementById('emergencyAlert').style.display = 'none';
+                    }
+                })
+                .catch(error => console.error('Error:', error));
+        }
+        
+        setInterval(updateDashboard, 1000);
+        updateDashboard();
+    </script>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+// ==================== API HANDLERS ====================
+void handleAPIData() {
+  StaticJsonDocument<512> doc;
+  
+  doc["bpm"] = (status.heartbeatOk && sensor.heartRate > 0) ? round(sensor.heartRate) : 0;
+  doc["temp"] = (status.tempOk && sensor.temperature > -50) ? sensor.temperature : 0;
+  doc["fall"] = sensor.fallDetected;
+  doc["emergency"] = sensor.emergencyActive;
+  doc["heartbeatOk"] = status.heartbeatOk;
+  doc["tempOk"] = status.tempOk;
+  doc["mpuOk"] = status.mpuOk;
+  doc["wifiOk"] = status.wifiOk;
+  doc["errorMsg"] = status.errorMessages;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleNeedAssistance() {
+  Serial.println("[ALERT] PATIENT REQUESTED MEDICAL ASSISTANCE!");
+  sensor.emergencyActive = true;
+  
+  StaticJsonDocument<64> doc;
+  doc["success"] = true;
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleClearEmergency() {
+  sensor.emergencyActive = false;
+  sensor.fallDetected = false;
+  status.errorMessages = "";
+  Serial.println("[INFO] Emergency cleared by user response");
+  
+  StaticJsonDocument<64> doc;
+  doc["success"] = true;
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void setupWebServer() {
+  server.on("/", handleRoot);
+  server.on("/api/data", handleAPIData);
+  server.on("/api/need_assistance", HTTP_POST, handleNeedAssistance);
+  server.on("/api/clear_emergency", HTTP_POST, handleClearEmergency);
+  server.begin();
+  Serial.println("[INFO] Web server started");
+}
+
+// ==================== SENSOR READING TASK ====================
+void readAllSensors() {
+  unsigned long now = millis();
+  
+  // Process heartbeat
+  if (newBeatAvailable) {
+    float newBPM = calculateBPM();
+    if (newBPM > 0) {
+      sensor.heartRate = newBPM;
+      status.heartbeatOk = true;
+      lastHeartbeatTime = now;
+    }
+    newBeatAvailable = false;
+  } else if (now - lastHeartbeatTime > 3000) {
+    // No heartbeat detected for 3 seconds
+    if (status.heartbeatOk) {
+      status.heartbeatOk = false;
+      Serial.println("[WARN] Heartbeat signal lost - check sensor placement");
+    }
+  }
+  
+  // Read temperature every 2 seconds
+  static unsigned long lastTempRead = 0;
+  if (now - lastTempRead >= 2000) {
+    sensor.temperature = readTemperature();
+    lastTempRead = now;
+  }
+  
+  // Update fall detection
+  updateFallDetection();
+  
+  // Check for emergencies
+  checkEmergencyConditions();
+}
+
+// ==================== SERIAL DEBUG OUTPUT ====================
+void serialDebugOutput() {
+  static unsigned long lastOutput = 0;
+  unsigned long now = millis();
+  
+  if (now - lastOutput >= 3000) {
+    Serial.println("\n===============================================");
+    Serial.println("     IoT HEALTH MONITOR - LIVE DATA");
+    Serial.println("===============================================");
+    
+    // Heart Rate
+    Serial.print("Heart Rate: ");
+    if (status.heartbeatOk && sensor.heartRate > 0) {
+      Serial.printf("%5.0f BPM", sensor.heartRate);
+      if (sensor.heartRate < HEART_RATE_MIN) Serial.print(" [LOW]");
+      else if (sensor.heartRate > HEART_RATE_MAX) Serial.print(" [HIGH]");
+      else Serial.print(" [NORMAL]");
+    } else {
+      Serial.print("   -- BPM (No Signal)");
+    }
+    Serial.println();
+    
+    // Temperature
+    Serial.print("Temperature: ");
+    if (status.tempOk && sensor.temperature > -50) {
+      Serial.printf("%5.1f C", sensor.temperature);
+      if (sensor.temperature < TEMP_MIN) Serial.print(" [LOW]");
+      else if (sensor.temperature > TEMP_MAX) Serial.print(" [HIGH]");
+      else Serial.print(" [NORMAL]");
+    } else {
+      Serial.print("    -- C (Sensor Error)");
+    }
+    Serial.println();
+    
+    // Accelerometer
+    Serial.printf("Accelerometer: X=%6.2f  Y=%6.2f  Z=%6.2f m/s^2\n", 
+                  sensor.accelX, sensor.accelY, sensor.accelZ);
+    
+    // Fall Status
+    Serial.print("Fall Status: ");
+    if (sensor.fallDetected) {
+      Serial.print("FALL DETECTED!");
+    } else {
+      Serial.print("No Fall Detected");
+    }
+    Serial.println();
+    
+    // Emergency Status
+    Serial.print("Emergency: ");
+    if (sensor.emergencyActive) {
+      Serial.print("ACTIVE - Medical assistance may be needed");
+    } else {
+      Serial.print("No Active Emergencies");
+    }
+    Serial.println();
+    
+    // WiFi Status
+    Serial.print("WiFi: ");
+    Serial.print(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+    Serial.print(" | IP: ");
+    Serial.println(WiFi.localIP());
+    
+    Serial.println("===============================================\n");
+    lastOutput = now;
+  }
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n\n========================================");
+  Serial.println("IoT Health Monitoring System Starting...");
+  Serial.println("========================================\n");
+  
+  // Initialize Heartbeat Sensor (GPIO34)
+  pinMode(HEARTBEAT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(HEARTBEAT_PIN), heartbeatISR, RISING);
+  Serial.println("[OK] Heartbeat sensor initialized on GPIO34");
+  
+  // Initialize DS18B20
+  pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
+
+  ds18b20.begin();
+
+  Serial.println("[OK] DS18B20 initialized on GPIO4 with internal pullup");
+  
+  // Initialize MPU6050
+  if (!initMPU6050()) {
+    Serial.println("[WARN] MPU6050 not detected - fall detection disabled");
+  }
+  
+  // Connect to WiFi
+  Serial.printf("\n[WiFi] Connecting to %s", ssid);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Connected successfully!");
+    Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
+    status.wifiOk = true;
+  } else {
+    Serial.println("\n[WiFi] Failed to connect! Check credentials.");
+    status.wifiOk = false;
+  }
+  
+  // Setup Web Server
+  setupWebServer();
+  
+  Serial.println("\n[OK] System ready!");
+  Serial.println("[INFO] Access the dashboard at: http://" + WiFi.localIP().toString());
+  Serial.println("[INFO] Monitoring started...\n");
+}
+
+// ==================== LOOP ====================
+void loop() {
+  static unsigned long lastSensorRead = 0;
+  unsigned long now = millis();
+  
+  // Read sensors every 100ms
+  if (now - lastSensorRead >= 100) {
+    readAllSensors();
+    lastSensorRead = now;
+  }
+  
+  // Handle web requests
+  server.handleClient();
+  
+  // Serial debugging output
+  serialDebugOutput();
+  
+  delay(10);  // Small delay for stability
+}
